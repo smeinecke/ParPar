@@ -1,0 +1,236 @@
+name: Test Rust
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'rust/**'
+      - '.github/workflows/test-rust.yml'
+
+jobs:
+  # Workspace suite (differential tests vs the C++ FFI oracle; OpenCL tests
+  # auto-skip without a device; e2e_gen auto-skips without a JS oracle)
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds the C++ oracle too (full differential suite)
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, ffi: '1' }
+          # Other platforms exercise the pure-Rust crates only - the C++
+          # oracle build (parpar-sys/cmake) is Linux-only for now
+          - { os: macos-latest,   target: aarch64-apple-darwin, ffi: '' }
+          - { os: macos-13,       target: x86_64-apple-darwin, ffi: '' }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ffi: '' }
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: cargo test --workspace (with C++ oracle)
+        if: matrix.ffi == '1'
+        run: cargo test --workspace --all-targets
+        working-directory: rust
+      - name: cargo test --workspace (release, with C++ oracle)
+        if: matrix.ffi == '1'
+        run: cargo test --workspace --release
+        working-directory: rust
+      - name: cargo test (native crates)
+        if: matrix.ffi == ''
+        run: cargo test -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl
+        working-directory: rust
+      - name: cargo build --no-default-features
+        if: matrix.ffi == ''
+        run: cargo build --release --no-default-features -p parpar
+        working-directory: rust
+
+  # linux-arm64 (native ARM runner where available; exercises scalar/NEON
+  # dispatch paths)
+  test-arm64:
+    name: cargo test (ubuntu-24.04-arm)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - run: cargo test -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl
+        working-directory: rust
+      - run: cargo build --release --no-default-features -p parpar
+        working-directory: rust
+
+  # Pure-Rust build: no parpar-sys/parpar-ffi/C++ runtime in the tree
+  no-ffi:
+    name: no-default-features build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: build without FFI
+        run: cargo build --release --no-default-features -p parpar
+        working-directory: rust
+      - name: no C++ runtime linkage
+        run: |
+          ! ldd target/release/parpar | grep -E 'libstdc\+\+|libgcc|libuv'
+          ! cargo tree --no-default-features -p parpar | grep -E 'parpar-sys|parpar-ffi'
+        working-directory: rust
+      - name: generate + FORCE_FFI clean error
+        run: |
+          head -c 1M /dev/urandom > /tmp/in.bin
+          ./target/release/parpar -q -s256K -r4 -o /tmp/noffi.par2 /tmp/in.bin
+          test -f /tmp/noffi.par2
+          if PARPAR_FORCE_FFI=1 ./target/release/parpar -q -s256K -r4 -o /tmp/x.par2 /tmp/in.bin; then
+            echo "FORCE_FFI should fail on a no-ffi build" >&2; exit 1
+          fi
+        working-directory: rust
+
+  # Full differential: build the pinned JS addon so e2e_gen's node oracle
+  # runs against the real reference implementation
+  oracle:
+    name: e2e vs JS oracle
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: build pinned JS addon
+        run: npm install
+        continue-on-error: true
+      - name: cargo test --workspace
+        env:
+          PARPAR_FFI_BIN: ${{ github.workspace }}/rust/target/release/parpar
+        run: |
+          cargo build --release -p parpar
+          cargo test --workspace --release
+        working-directory: rust
+
+  # Cross-arch kernel coverage: aarch64 (NEON/CLMul/SHA3) and riscv64
+  # (scalar baseline) under qemu-user. musl targets link self-contained
+  # via rust-lld; the runner paths match rust/.cargo/config.toml.
+  test-qemu:
+    name: cargo test (qemu cross-arch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl,riscv64gc-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: extract qemu-user
+        run: |
+          mkdir -p /tmp/qemu-user/root
+          cd /tmp/qemu-user
+          apt-get download qemu-user
+          dpkg-deb -x qemu-user_*.deb root
+      - name: aarch64 NEON/CLMul/SHA3 tests
+        run: cargo test --target aarch64-unknown-linux-musl -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl
+        working-directory: rust
+      - name: aarch64 e2e generation
+        run: |
+          cargo build --release --target aarch64-unknown-linux-musl -p parpar --no-default-features
+          head -c 2M /dev/urandom > /tmp/qin.bin
+          /tmp/qemu-user/root/usr/bin/qemu-aarch64 target/aarch64-unknown-linux-musl/release/parpar -q -s256K -r4 -o /tmp/qarm.par2 /tmp/qin.bin
+          test -f /tmp/qarm.par2
+        working-directory: rust
+      - name: riscv64 scalar tests
+        run: cargo test --target riscv64gc-unknown-linux-musl -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl
+        working-directory: rust
+
+  # AVX512/VBMI/GFNI kernel coverage under Intel SDE (-spr model emulates
+  # all gated ISAs). Runs the crate unit tests plus the FFI differential,
+  # which instantiates the real C++ kernels under the same emulation.
+  test-sde:
+    name: cargo test (Intel SDE -spr)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: fetch Intel SDE 10.13.1
+        run: |
+          curl -fL --retry 3 -A "Mozilla/5.0" \
+            -o /tmp/sde.tar.xz \
+            "https://downloadmirror.intel.com/924984/sde-external-10.13.1-2026-07-28-lin.tar.xz"
+          echo "94e97d623fec54385686e1e7ba65ebc9941748c05ee451423948334892bf2b50  /tmp/sde.tar.xz" | sha256sum -c -
+          mkdir -p /tmp/sde
+          tar -xJf /tmp/sde.tar.xz --strip-components=1 -C /tmp/sde
+      - name: run test binaries under SDE
+        run: |
+          cargo test -p parpar-gf16 --no-run
+          for t in target/debug/deps/parpar_gf16-* target/debug/deps/differential-* target/debug/deps/name_check-* target/debug/deps/coverage-* target/debug/deps/meta_parity-*; do
+            [ -x "$t" ] || continue
+            echo "== $t"
+            /tmp/sde/sde64 -spr -- "$t" || exit 1
+          done
+        working-directory: rust
+
+  # Release binaries for every supported architecture. Pure-Rust builds
+  # (--no-default-features): no C++ runtime dependency; musl targets are
+  # fully static via rust-lld (see rust/.cargo/config.toml).
+  build-binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc + static musl for Linux/x86_64
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-musl }
+          # aarch64 + riscv64 cross-compile self-contained via rust-lld
+          - { os: ubuntu-latest,    target: aarch64-unknown-linux-musl }
+          - { os: ubuntu-latest,    target: riscv64gc-unknown-linux-musl }
+          # native ARM runner for the aarch64 glibc binary
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          # macOS both arches, Windows x86_64
+          - { os: macos-13,         target: x86_64-apple-darwin }
+          - { os: macos-latest,     target: aarch64-apple-darwin }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc }
+    name: binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: build
+        run: cargo build --release --no-default-features --target ${{ matrix.target }} -p parpar
+        working-directory: rust
+      - name: package
+        shell: bash
+        run: |
+          exe=""
+          [[ "${{ matrix.target }}" == *windows* ]] && exe=".exe"
+          bin="target/${{ matrix.target }}/release/parpar${exe}"
+          test -f "$bin"
+          cp "$bin" "${{ github.workspace }}/parpar-${{ matrix.target }}${exe}"
+        working-directory: rust
+      - uses: actions/upload-artifact@v4
+        with:
+          name: parpar-${{ matrix.target }}
+          path: parpar-${{ matrix.target }}*

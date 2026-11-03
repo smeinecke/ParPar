@@ -1,0 +1,6 @@
+[package]
+name = "parpar-backend"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared backend contracts (types/traits) for ParPar compute backends"

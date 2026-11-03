@@ -1,0 +1,9 @@
+[package]
+name = "parpar-hasher"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native Rust hashing for ParPar (MD5 x2 input hasher, multi-buffer MD5 output hasher, CRC32 zero-pad)"
+
+[dependencies]
+parpar-backend = { path = "../parpar-backend" }

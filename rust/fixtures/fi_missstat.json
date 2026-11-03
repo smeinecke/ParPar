@@ -1,0 +1,1 @@
+{"error":"[Error: ENOENT: no such file or directory, stat '/home/stefan/github/ParPar/rust/fixtures/tree/missing.bin'] {\n  errno: -2,\n  code: 'ENOENT',\n  syscall: 'stat',\n  path: '/home/stefan/github/ParPar/rust/fixtures/tree/missing.bin'\n}"}

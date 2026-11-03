@@ -1,0 +1,383 @@
+{
+  "gf_methods": [
+    {
+      "js_name": "auto",
+      "info": {
+        "id": 19,
+        "name": "Xor-Jit (AVX2)",
+        "alignment": 32,
+        "stride": 512,
+        "target_chunk": 131072,
+        "target_grouping": 1
+      }
+    },
+    {
+      "js_name": "lookup",
+      "info": {
+        "id": 1,
+        "name": "Lookup",
+        "alignment": 8,
+        "stride": 8,
+        "target_chunk": 32768,
+        "target_grouping": 1
+      }
+    },
+    {
+      "js_name": "lookup-sse",
+      "info": {
+        "id": 2,
+        "name": "Lookup (SSE2)",
+        "alignment": 16,
+        "stride": 16,
+        "target_chunk": 32768,
+        "target_grouping": 1
+      }
+    },
+    {
+      "js_name": "3p_lookup",
+      "info": {
+        "id": 3,
+        "name": "3-part Lookup",
+        "alignment": 8,
+        "stride": 8,
+        "target_chunk": 32768,
+        "target_grouping": 1
+      }
+    },
+    {
+      "js_name": "shuffle-neon",
+      "info": {
+        "id": 4,
+        "name": "Shuffle (NEON)",
+        "alignment": 32,
+        "stride": 32,
+        "target_chunk": 16384,
+        "target_grouping": 1
+      }
+    },
+    {
+      "js_name": "shuffle128-sve",
+      "info": {
+        "id": 5,
+        "name": "Shuffle-128 (SVE)",
+        "alignment": 16,
+        "stride": 0,
+        "target_chunk": 16384,
+        "target_grouping": 3
+      }
+    },
+    {
+      "js_name": "shuffle128-sve2",
+      "info": {
+        "id": 6,
+        "name": "Shuffle-128 (SVE2)",
+        "alignment": 16,
+        "stride": 0,
+        "target_chunk": 16384,
+        "target_grouping": 3
+      }
+    },
+    {
+      "js_name": "shuffle2x128-sve2",
+      "info": {
+        "id": 7,
+        "name": "Shuffle2x-128 (SVE2)",
+        "alignment": 32,
+        "stride": 0,
+        "target_chunk": 8192,
+        "target_grouping": 6
+      }
+    },
+    {
+      "js_name": "shuffle512-sve2",
+      "info": {
+        "id": 8,
+        "name": "Shuffle-512 (SVE2)",
+        "alignment": 64,
+        "stride": 0,
+        "target_chunk": 8192,
+        "target_grouping": 4
+      }
+    },
+    {
+      "js_name": "shuffle128-rvv",
+      "info": {
+        "id": 9,
+        "name": "Shuffle-128 (RVV)",
+        "alignment": 16,
+        "stride": 0,
+        "target_chunk": 16384,
+        "target_grouping": 3
+      }
+    },
+    {
+      "js_name": "shuffle-sse",
+      "info": {
+        "id": 10,
+        "name": "Shuffle (SSSE3)",
+        "alignment": 16,
+        "stride": 32,
+        "target_chunk": 16384,
+        "target_grouping": 1
+      }
+    },
+    {
+      "js_name": "shuffle-avx",
+      "info": {
+        "id": 11,
+        "name": "Shuffle (AVX)",
+        "alignment": 16,
+        "stride": 32,
+        "target_chunk": 16384,
+        "target_grouping": 1
+      }
+    },
+    {
+      "js_name": "shuffle-avx2",
+      "info": {
+        "id": 12,
+        "name": "Shuffle (AVX2)",
+        "alignment": 32,
+        "stride": 64,
+        "target_chunk": 8192,
+        "target_grouping": 1
+      }
+    },
+    {
+      "js_name": "shuffle-avx512",
+      "info": {
+        "id": 13,
+        "name": "Shuffle (AVX512)",
+        "alignment": 64,
+        "stride": 128,
+        "target_chunk": 8192,
+        "target_grouping": 3
+      }
+    },
+    {
+      "js_name": "shuffle-vbmi",
+      "info": {
+        "id": 14,
+        "name": "Shuffle (VBMI)",
+        "alignment": 64,
+        "stride": 128,
+        "target_chunk": 8192,
+        "target_grouping": 4
+      }
+    },
+    {
+      "js_name": "shuffle2x-avx2",
+      "info": {
+        "id": 15,
+        "name": "Shuffle2x (AVX2)",
+        "alignment": 32,
+        "stride": 32,
+        "target_chunk": 8192,
+        "target_grouping": 2
+      }
+    },
+    {
+      "js_name": "shuffle2x-avx512",
+      "info": {
+        "id": 16,
+        "name": "Shuffle2x (AVX512)",
+        "alignment": 64,
+        "stride": 64,
+        "target_chunk": 8192,
+        "target_grouping": 6
+      }
+    },
+    {
+      "js_name": "xor-sse",
+      "info": {
+        "id": 17,
+        "name": "Xor (SSE2)",
+        "alignment": 16,
+        "stride": 256,
+        "target_chunk": 32768,
+        "target_grouping": 1
+      }
+    },
+    {
+      "js_name": "xorjit-sse",
+      "info": {
+        "id": 18,
+        "name": "Xor-Jit (SSE2)",
+        "alignment": 16,
+        "stride": 256,
+        "target_chunk": 65536,
+        "target_grouping": 1
+      }
+    },
+    {
+      "js_name": "xorjit-avx2",
+      "info": {
+        "id": 19,
+        "name": "Xor-Jit (AVX2)",
+        "alignment": 32,
+        "stride": 512,
+        "target_chunk": 131072,
+        "target_grouping": 1
+      }
+    },
+    {
+      "js_name": "xorjit-avx512",
+      "info": {
+        "id": 20,
+        "name": "Xor-Jit (AVX512)",
+        "alignment": 64,
+        "stride": 1024,
+        "target_chunk": 49152,
+        "target_grouping": 6
+      }
+    },
+    {
+      "js_name": "affine-sse",
+      "info": {
+        "id": 21,
+        "name": "Affine (GFNI)",
+        "alignment": 16,
+        "stride": 32,
+        "target_chunk": 8192,
+        "target_grouping": 3
+      }
+    },
+    {
+      "js_name": "affine-avx2",
+      "info": {
+        "id": 22,
+        "name": "Affine (GFNI+AVX2)",
+        "alignment": 32,
+        "stride": 64,
+        "target_chunk": 4096,
+        "target_grouping": 3
+      }
+    },
+    {
+      "js_name": "affine-avx512",
+      "info": {
+        "id": 23,
+        "name": "Affine (GFNI+AVX512)",
+        "alignment": 64,
+        "stride": 128,
+        "target_chunk": 4096,
+        "target_grouping": 6
+      }
+    },
+    {
+      "js_name": "affine2x-sse",
+      "info": {
+        "id": 24,
+        "name": "Affine2x (GFNI)",
+        "alignment": 16,
+        "stride": 16,
+        "target_chunk": 8192,
+        "target_grouping": 6
+      }
+    },
+    {
+      "js_name": "affine2x-avx2",
+      "info": {
+        "id": 25,
+        "name": "Affine2x (GFNI+AVX2)",
+        "alignment": 32,
+        "stride": 32,
+        "target_chunk": 4096,
+        "target_grouping": 6
+      }
+    },
+    {
+      "js_name": "affine2x-avx512",
+      "info": {
+        "id": 26,
+        "name": "Affine2x (GFNI+AVX512)",
+        "alignment": 64,
+        "stride": 64,
+        "target_chunk": 4096,
+        "target_grouping": 12
+      }
+    },
+    {
+      "js_name": "affine-bmm",
+      "info": {
+        "id": 27,
+        "name": "Affine (BMM)",
+        "alignment": 64,
+        "stride": 64,
+        "target_chunk": 4096,
+        "target_grouping": 12
+      }
+    },
+    {
+      "js_name": "clmul-neon",
+      "info": {
+        "id": 28,
+        "name": "CLMul (NEON)",
+        "alignment": 32,
+        "stride": 32,
+        "target_chunk": 8192,
+        "target_grouping": 3
+      }
+    },
+    {
+      "js_name": "clmul-sha3",
+      "info": {
+        "id": 29,
+        "name": "CLMul (SHA3)",
+        "alignment": 32,
+        "stride": 32,
+        "target_chunk": 8192,
+        "target_grouping": 3
+      }
+    },
+    {
+      "js_name": "clmul-sve2",
+      "info": {
+        "id": 30,
+        "name": "CLMul (SVE2)",
+        "alignment": 16,
+        "stride": 0,
+        "target_chunk": 8192,
+        "target_grouping": 8
+      }
+    },
+    {
+      "js_name": "clmul-rvv",
+      "info": {
+        "id": 31,
+        "name": "CLMul (RVV+Zvbc)",
+        "alignment": 16,
+        "stride": 0,
+        "target_chunk": 8192,
+        "target_grouping": 12
+      }
+    }
+  ],
+  "hasher_input_method": "BMI1+PCLMUL",
+  "hasher_output_method": "AVX2",
+  "opencl_platforms": [
+    {
+      "id": 0,
+      "name": "NVIDIA CUDA",
+      "devices": [
+        {
+          "id": 0,
+          "name": "NVIDIA GeForce RTX 2080",
+          "vendor_id": 4318,
+          "available": true,
+          "supported": true,
+          "type": "GPU",
+          "memory_global": 8176730112,
+          "cache_global": 1507328,
+          "memory_unified": false,
+          "memory_constant": 65536,
+          "memory_local": 49152,
+          "memory_max_alloc": 2044182528,
+          "workgroup_limit": 1024,
+          "workgroup_multiple": 32,
+          "compute_units": 46
+        }
+      ]
+    }
+  ]
+}

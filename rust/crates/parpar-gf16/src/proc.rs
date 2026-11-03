@@ -1,0 +1,909 @@
+//! Native GfProc: CPU implementation of the GF(2^16) multiply-accumulate
+//! pipeline with a background worker thread, mirroring PAR2ProcCPU's
+//! processQueue - hashing/IO on the pipeline thread overlaps with the GF
+//! multiply on the worker.
+//!
+//! Semantics mirror PAR2ProcCPU + the shim's proc wrapper:
+//! - `add_input` packs the input on the caller thread (like the C++
+//!   prepare_packed in addInput) then hands it to the worker channel;
+//!   it returns `AddResult::Full` when `staging_limit*batchsize` inputs
+//!   are in flight (the C++ staging-area bound)
+//! - the worker accumulates inputs into batches of `input_batchsize`; a
+//!   batch flushes when full or on `end_input`; `InputDone` fires per
+//!   input when its batch flush completes (staging freed)
+//! - each input is zero-padded to `current_slice_size` and, for every
+//!   recovery output j, XOR-accumulated with coefficient
+//!   `gfmat_coeff(input_index, exponents[j])`
+//! - the first flush after `set_recovery_slices` overwrites outputs
+//!   (processing_add=false); later flushes accumulate
+//! - `get_output` returns `current_slice_size` bytes plus a corruption
+//!   self-check flag, processed in channel order after `end_input`
+
+use crate::gf::{gfmat_coeff_from_log, gfmat_input_log};
+use crate::kernel::{packed_len, pick_explicit, GfKernel};
+use parpar_backend::{
+    AddResult, BackendError, CpuSpec, GfCpuInfo, GfInfo, GfProc, ProcEvent, Result, SliceBuf,
+};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+pub type EventQueues = Arc<Mutex<HashMap<usize, VecDeque<ProcEvent>>>>;
+
+struct StagedInput {
+    buf: SliceBuf,
+    input_index: i64,
+    token: u64,
+    coeffs: Vec<u16>, // one coefficient per recovery output
+    packed: Vec<u8>,  // kernel-packed form, filled by the caller thread
+}
+
+/// GF(2^16) lane checksum (gf16_checksum_generic equivalent): each u16 lane
+/// of a u64 word evolves as c = c*2 ^ data.
+#[inline(always)]
+fn mul2x4(v: u64) -> u64 {
+    const MASK: u64 = 0x0001_0001_0001_0001;
+    (v.wrapping_mul(2) & !MASK) ^ ((v >> 15) & MASK).wrapping_mul(0x100B)
+}
+
+fn cksum_update(mut c: u64, data: &[u8]) -> u64 {
+    let mut chunks = data.chunks_exact(8);
+    for w in &mut chunks {
+        c = mul2x4(c) ^ u64::from_le_bytes(w.try_into().unwrap());
+    }
+    let rem = chunks.remainder();
+    if !rem.is_empty() {
+        let mut buf = [0u8; 8];
+        buf[..rem.len()].copy_from_slice(rem);
+        c = mul2x4(c) ^ u64::from_le_bytes(buf);
+    }
+    c
+}
+
+/// Caller/worker shared configuration: caller methods validate against
+/// atomics while the worker owns the compute state. Config mutations go
+/// through the command channel so the worker sees them in FIFO order.
+struct Shared {
+    exponents_set: AtomicBool,
+    outputs_count: AtomicUsize,
+    current_slice_size: AtomicU64,
+    /// inputs handed to the worker but not yet flushed (staging bound)
+    pending: AtomicUsize,
+    num_threads: AtomicI32,
+    progress_on: AtomicBool,
+    closed: AtomicBool,
+    /// worker exited - sends fail fast instead of queueing forever
+    worker_dead: AtomicBool,
+}
+
+enum Cmd {
+    Input(StagedInput),
+    End {
+        token: u64,
+    },
+    Output {
+        index: usize,
+        out: SliceBuf,
+        token: u64,
+    },
+    SyncRecovery {
+        exponents: Vec<u16>,
+        count: usize,
+    },
+    SliceSize {
+        alloc: u64,
+        current: u64,
+    },
+    FreeMem,
+    Close,
+}
+
+/// Worker-owned compute state (single-threaded access inside the worker).
+struct Worker {
+    exponents: Vec<u16>,
+    outputs: Vec<Vec<u8>>,
+    output_cksum: Vec<u64>,
+    processing_add: bool,
+    batch: Vec<StagedInput>,
+    needs_discard: bool,
+    stat_batches: u32,
+    slice_size: u64,
+    current_slice_size: u64,
+    input_batchsize: u32,
+    chunk_size: u32,
+}
+
+impl Worker {
+    fn aligned_size(&self, kernel: &dyn GfKernel) -> usize {
+        packed_len(kernel, self.current_slice_size as usize)
+    }
+
+    /// discardOutput(): after an Ended event, the next add/end resets
+    /// output accumulation (matches the shim's pendingDiscardOutput logic -
+    /// chunk passes produce independent output chunks, not accumulation).
+    fn maybe_discard(&mut self) {
+        if self.needs_discard {
+            self.processing_add = false;
+            self.needs_discard = false;
+        }
+    }
+
+    fn flush_batch(
+        &mut self,
+        kernel: &Arc<dyn GfKernel>,
+        shared: &Shared,
+        emit: &dyn Fn(ProcEvent),
+    ) {
+        if self.batch.is_empty() {
+            return;
+        }
+        self.stat_batches += 1;
+        let len = self.aligned_size(&**kernel);
+        let mut staged = std::mem::take(&mut self.batch);
+        // zero-length slice region: nothing to multiply - release staging
+        if len == 0 {
+            let n = staged.len();
+            for inp in staged {
+                emit(ProcEvent::InputDone {
+                    token: inp.token,
+                    input_index: inp.input_index,
+                    buf: inp.buf,
+                });
+            }
+            shared.pending.fetch_sub(n, Ordering::Release);
+            return;
+        }
+        if self.outputs.len() < self.exponents.len() {
+            self.outputs
+                .resize_with(self.exponents.len(), || vec![0u8; len]);
+        }
+        let mut coeffs: Vec<Vec<u16>> = Vec::with_capacity(staged.len());
+        for inp in staged.iter_mut() {
+            coeffs.push(std::mem::take(&mut inp.coeffs));
+            let packed = std::mem::take(&mut inp.packed);
+            // keep the packed region alive inside the staging slot until the
+            // multiply completes - store it back for the work loop
+            inp.packed = packed;
+            let buf = std::mem::replace(
+                &mut inp.buf,
+                SliceBuf::new(Vec::new().into_boxed_slice(), 0),
+            );
+            // InputDone is deferred until after the multiply: the staging
+            // slot (and the input buffer with it) frees when the batch's
+            // compute finishes, not when it is queued
+            inp.buf = buf;
+        }
+
+        let nthreads = (shared.num_threads.load(Ordering::Relaxed) as usize).clamp(1, 32);
+        let nouts = self.outputs.len();
+        let block = kernel.block_len().max(1);
+        // tile-major ordering (mirrors the C++ idealChunkSize loop): each
+        // tile's input region stays cache-hot while all outputs multiply
+        // through it - output-major order would re-read every packed input
+        // from DRAM per output
+        let tile_len = if self.chunk_size > 0 {
+            self.chunk_size as usize
+        } else {
+            crate::kernel::method_info(kernel.id()).target_chunk as usize
+        };
+        let tile_len = tile_len.max(block).min(len).div_ceil(block) * block;
+        let first_mul = !self.processing_add;
+        let kernel_ref: &dyn GfKernel = &**kernel;
+
+        // tasks: (tile offset, tile len, output index, dst slice) -
+        // tile-major order so threads sweep the same tile range together.
+        // Each output is sliced into tiles via one chunks_mut borrow -
+        // slices of different outputs never alias (separate allocs)
+        let mut out_tiles: Vec<std::slice::ChunksMut<u8>> = self
+            .outputs
+            .iter_mut()
+            .map(|o| o.chunks_mut(tile_len))
+            .collect();
+        let ntiles = out_tiles.first().map(|c| c.len()).unwrap_or(0);
+        let mut tasks: Vec<(usize, usize, usize, &mut [u8])> = Vec::with_capacity(ntiles * nouts);
+        for t in 0..ntiles {
+            let toff = t * tile_len;
+            for (o, ch) in out_tiles.iter_mut().enumerate() {
+                let dst = ch.next().unwrap();
+                tasks.push((toff, dst.len(), o, dst));
+            }
+        }
+        let ntasks = tasks.len();
+        let coeffs = &coeffs;
+        let packed_inputs: Vec<&[u8]> = staged.iter().map(|i| &i.packed[..]).collect();
+        let work = |group: Vec<(usize, usize, usize, &mut [u8])>| {
+            for (toff, tl, o, dst) in group {
+                for (i, packed) in packed_inputs.iter().enumerate() {
+                    // a staged input may be shorter than tl if the slice
+                    // size grew after staging - treat the missing region as
+                    // zeros (it contributes c*0 = 0 to every output)
+                    let send = (toff + tl).min(packed.len());
+                    let src = &packed[toff.min(send)..send];
+                    // coeffs were captured at add_input time against the
+                    // then-current output count; a later SyncRecovery can
+                    // grow outputs - C++ zero-fills resized procCoeffs, so
+                    // missing entries act as coefficient 0 (skip)
+                    let coeff = coeffs[i].get(o).copied().unwrap_or(0);
+                    // C++ routes coefficient-0 outputs through add_multi and
+                    // skips them entirely; coefficient-1 is a plain XOR add
+                    // (exponent 0 -> GF element 1), no GF multiply needed
+                    match coeff {
+                        0 if i == 0 && first_mul => dst.fill(0),
+                        0 => {}
+                        1 if i == 0 && first_mul => {
+                            dst[..src.len()].copy_from_slice(src);
+                            dst[src.len()..].fill(0);
+                        }
+                        1 => {
+                            for (d, s) in dst.iter_mut().zip(src) {
+                                *d ^= s;
+                            }
+                        }
+                        c if i == 0 && first_mul => {
+                            kernel_ref.mul(dst, src, c);
+                            dst[src.len()..].fill(0);
+                        }
+                        c => kernel_ref.muladd(dst, src, c),
+                    }
+                }
+            }
+        };
+        if nthreads > 1 && ntasks > 1 {
+            let mut it = tasks.into_iter();
+            let work = &work;
+            std::thread::scope(|sc| {
+                for t in 0..nthreads {
+                    let lo = t * ntasks / nthreads;
+                    let hi = (t + 1) * ntasks / nthreads;
+                    let group: Vec<_> = it.by_ref().take(hi - lo).collect();
+                    if group.is_empty() {
+                        continue;
+                    }
+                    sc.spawn(move || work(group));
+                }
+            });
+        } else {
+            work(tasks);
+        }
+        if !self.processing_add {
+            self.processing_add = true;
+        }
+        // staging freed: buffers return to the pool and the pending count
+        // drops - this is what lets a Full add_input succeed on retry
+        let n = staged.len();
+        for inp in staged {
+            emit(ProcEvent::InputDone {
+                token: inp.token,
+                input_index: inp.input_index,
+                buf: inp.buf,
+            });
+        }
+        shared.pending.fetch_sub(n, Ordering::Release);
+        if shared.progress_on.load(Ordering::Relaxed) {
+            emit(ProcEvent::Progress {
+                num_inputs: n as i64,
+            });
+        }
+    }
+
+    fn finalize_cksums(&mut self, kernel: &dyn GfKernel) {
+        let len = self.aligned_size(kernel);
+        self.output_cksum = self
+            .outputs
+            .iter()
+            .map(|o| cksum_update(0, &o[..len.min(o.len())]))
+            .collect();
+    }
+}
+
+pub struct NativeGfProc {
+    proc_id: usize,
+    queues: EventQueues,
+    shared: Arc<Shared>,
+    tx: Option<Sender<Cmd>>,
+    worker: Option<JoinHandle<()>>,
+    kernel: Arc<dyn GfKernel>,
+    input_batchsize: u32,
+    #[allow(dead_code)]
+    input_minbatchsize: u32,
+    #[allow(dead_code)]
+    chunk_size: u32,
+    staging_limit: usize,
+    #[allow(dead_code)]
+    slice_offset: u64,
+    slice_size: u64,
+    /// caller-side copy of the configured exponents (for coeff packing);
+    /// the worker receives its own via Cmd::SyncRecovery
+    exponents: Vec<u16>,
+    /// tracks end_input issuance (C++ endSignalled); informational only -
+    /// deferred adds may legitimately arrive afterwards while the
+    /// post-end event pump drains staging
+    #[allow(dead_code)]
+    input_ended: bool,
+}
+
+impl NativeGfProc {
+    pub fn new(
+        proc_id: usize,
+        queues: EventQueues,
+        slice_size: u64,
+        cpu: Option<&CpuSpec>,
+        staging_areas: i32,
+    ) -> Result<Self> {
+        let (batchsize, minbatch, chunk, off, sz) = match cpu {
+            Some(c) => (
+                c.input_batchsize.max(1),
+                c.input_minbatchsize,
+                c.chunk_size,
+                c.slice_offset,
+                if c.slice_size != 0 {
+                    c.slice_size
+                } else {
+                    slice_size
+                },
+            ),
+            None => (1, 1, 0, 0, slice_size),
+        };
+        // pick_explicit: unsupported/unimplemented methods error like the
+        // C++ proc init rather than silently falling back
+        let kernel: Arc<dyn GfKernel> = pick_explicit(cpu.map(|c| c.method).unwrap_or(0))
+            .map(Arc::from)
+            .ok_or_else(|| BackendError::new("GF16 method not supported on this CPU"))?;
+        let staging_limit = staging_areas.max(1) as usize;
+        let shared = Arc::new(Shared {
+            exponents_set: AtomicBool::new(false),
+            outputs_count: AtomicUsize::new(0),
+            current_slice_size: AtomicU64::new(sz),
+            pending: AtomicUsize::new(0),
+            num_threads: AtomicI32::new(
+                // C++ GfProc defaults to hardware concurrency; JS only calls
+                // setNumThreads when the user passes a count explicitly
+                std::thread::available_parallelism()
+                    .map(|n| n.get() as i32)
+                    .unwrap_or(1),
+            ),
+            progress_on: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            worker_dead: AtomicBool::new(false),
+        });
+
+        let (tx, rx) = channel::<Cmd>();
+        let w_shared = shared.clone();
+        let w_queues = queues.clone();
+        let w_kernel = kernel.clone();
+        let mut w = Worker {
+            exponents: Vec::new(),
+            outputs: Vec::new(),
+            output_cksum: Vec::new(),
+            processing_add: false,
+            batch: Vec::new(),
+            needs_discard: false,
+            stat_batches: 0,
+            slice_size: sz,
+            current_slice_size: sz,
+            input_batchsize: batchsize,
+            chunk_size: chunk,
+        };
+        let worker = std::thread::spawn(move || {
+            // a panic inside the loop must still flag the worker dead -
+            // otherwise senders keep succeeding into the dead channel and
+            // `pending` never drains (has_staging_room stuck false). Also
+            // emit an Error event so waiters stop polling a dead queue.
+            struct DeadGuard(Arc<Shared>, EventQueues, usize);
+            impl Drop for DeadGuard {
+                fn drop(&mut self) {
+                    self.0.worker_dead.store(true, Ordering::Release);
+                    if std::thread::panicking() {
+                        // recover a poisoned lock - the panic may have
+                        // happened while holding it (emit/drain), and
+                        // losing this event leaves waiters spinning
+                        let mut q = self.1.lock().unwrap_or_else(|e| e.into_inner());
+                        q.entry(self.2).or_default().push_back(ProcEvent::Error {
+                            token: 0,
+                            message: "proc worker died".into(),
+                        });
+                    }
+                }
+            }
+            let _guard = DeadGuard(w_shared.clone(), w_queues.clone(), proc_id);
+            let emit = |ev: ProcEvent| {
+                w_queues
+                    .lock()
+                    .unwrap()
+                    .entry(proc_id)
+                    .or_default()
+                    .push_back(ev);
+            };
+            while let Ok(cmd) = rx.recv() {
+                match cmd {
+                    Cmd::Input(si) => {
+                        w.maybe_discard();
+                        w.batch.push(si);
+                        if w.batch.len() as u32 == w.input_batchsize {
+                            w.flush_batch(&w_kernel, &w_shared, &emit);
+                        }
+                    }
+                    Cmd::End { token } => {
+                        w.maybe_discard();
+                        w.flush_batch(&w_kernel, &w_shared, &emit);
+                        w.finalize_cksums(&*w_kernel);
+                        emit(ProcEvent::Ended { token });
+                        w.needs_discard = true;
+                    }
+                    Cmd::Output {
+                        index,
+                        mut out,
+                        token,
+                    } => {
+                        // outputs can be empty after FreeMem even though the
+                        // caller-side index bound (outputs_count) still passes
+                        let valid = if index < w.outputs.len() {
+                            if index < w.output_cksum.len() {
+                                let plen = w.aligned_size(&*w_kernel);
+                                let src = &w.outputs[index];
+                                cksum_update(0, &src[..plen.min(src.len())])
+                                    == w.output_cksum[index]
+                            } else {
+                                true
+                            }
+                        } else {
+                            false
+                        };
+                        let n = w.current_slice_size as usize;
+                        let avail = n.min(out.data.len());
+                        if index < w.outputs.len() {
+                            let src = std::mem::take(&mut w.outputs[index]);
+                            w_kernel.finish(&mut out.data[..avail], &src);
+                            w.outputs[index] = src;
+                            out.len = avail;
+                        } else {
+                            out.data[..avail].fill(0);
+                            out.len = avail;
+                        }
+                        emit(ProcEvent::OutputDone {
+                            token,
+                            cksum_valid: valid,
+                            buf: out,
+                        });
+                    }
+                    Cmd::SyncRecovery { exponents, count } => {
+                        w.exponents = exponents;
+                        if w.exponents.len() != count {
+                            w.exponents.resize(count, 1);
+                        }
+                        w.outputs = vec![vec![0u8; w.aligned_size(&*w_kernel)]; count];
+                        w.output_cksum.clear();
+                        w.processing_add = false;
+                    }
+                    Cmd::SliceSize { alloc, current } => {
+                        w.slice_size = w.slice_size.max(alloc);
+                        w.current_slice_size = current;
+                        // C++ setCurrentSliceSize reallocs memProcessing when
+                        // the aligned size grows; outputs must stay >=
+                        // aligned(current) or the next flush indexes past the
+                        // packed inputs
+                        let need = w.aligned_size(&*w_kernel);
+                        for o in w.outputs.iter_mut() {
+                            if o.len() < need {
+                                o.resize(need, 0);
+                            }
+                        }
+                    }
+                    Cmd::FreeMem => {
+                        // C++ freeProcessingMem frees processing buffers but
+                        // keeps the staging queue: staged inputs must still
+                        // flush (dropping them would lose contributions AND
+                        // wedge pending, since no InputDone would ever fire)
+                        w.outputs.clear();
+                        w.output_cksum.clear();
+                    }
+                    Cmd::Close => break,
+                }
+            }
+        });
+
+        Ok(NativeGfProc {
+            proc_id,
+            queues,
+            shared,
+            tx: Some(tx),
+            worker: Some(worker),
+            kernel,
+            input_batchsize: batchsize,
+            input_minbatchsize: minbatch.max(1),
+            chunk_size: chunk,
+            staging_limit,
+            slice_offset: off,
+            slice_size: sz,
+            exponents: Vec::new(),
+            input_ended: false,
+        })
+    }
+
+    /// Capacity for new inputs (used by the composite's can_add probing).
+    pub fn has_staging_room(&self) -> bool {
+        let cap = self.staging_limit * self.input_batchsize.max(1) as usize;
+        self.shared.pending.load(Ordering::Acquire) < cap
+    }
+
+    /// Blocking pop of this proc's own event queue (used by range adapters
+    /// that need synchronous semantics). `timeout` of zero waits forever.
+    /// A dead worker with an empty queue surfaces as an Error event rather
+    /// than spinning forever (covers the case where DeadGuard couldn't
+    /// emit, e.g. a poisoned queue lock).
+    pub fn wait_own_event(&self, timeout: Duration) -> Option<ProcEvent> {
+        let deadline = (!timeout.is_zero()).then(|| Instant::now() + timeout);
+        loop {
+            if let Some(ev) = self
+                .queues
+                .lock()
+                .unwrap()
+                .get_mut(&self.proc_id)
+                .and_then(|q| q.pop_front())
+            {
+                return Some(ev);
+            }
+            if self.shared.worker_dead.load(Ordering::Acquire) {
+                return Some(ProcEvent::Error {
+                    token: 0,
+                    message: "proc worker stopped".into(),
+                });
+            }
+            match deadline {
+                Some(d) if Instant::now() >= d => return None,
+                _ => std::thread::sleep(Duration::from_micros(200)),
+            }
+        }
+    }
+
+    fn send(&self, cmd: Cmd) -> Result<()> {
+        if self.shared.worker_dead.load(Ordering::Acquire) {
+            return Err(BackendError::new("proc worker stopped"));
+        }
+        self.tx
+            .as_ref()
+            .ok_or_else(|| BackendError::new("proc closed"))?
+            .send(cmd)
+            .map_err(|_| BackendError::new("proc worker stopped"))
+    }
+
+    fn aligned_size(&self) -> usize {
+        packed_len(
+            &*self.kernel,
+            self.shared.current_slice_size.load(Ordering::Relaxed) as usize,
+        )
+    }
+}
+
+impl Drop for NativeGfProc {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Cmd::Close);
+            drop(tx);
+        }
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl GfProc for NativeGfProc {
+    fn proc_id(&self) -> usize {
+        self.proc_id
+    }
+
+    fn set_num_threads(&mut self, threads: i32) -> Result<i32> {
+        // C++ setNumThreads(-1) means auto = hardware_concurrency
+        let threads = if threads < 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get() as i32)
+                .unwrap_or(1)
+        } else {
+            threads
+        };
+        self.shared.num_threads.store(threads, Ordering::Relaxed);
+        Ok(threads)
+    }
+
+    fn set_current_slice_size(&mut self, slice_size: u64) -> Result<()> {
+        if slice_size > self.slice_size {
+            self.slice_size = slice_size;
+        }
+        self.shared
+            .current_slice_size
+            .store(slice_size, Ordering::Release);
+        self.send(Cmd::SliceSize {
+            alloc: slice_size,
+            current: slice_size,
+        })
+    }
+
+    fn set_recovery_slices(&mut self, exponents: Option<&[u16]>, count: usize) -> Result<()> {
+        let mut exps = match exponents {
+            Some(e) => e.to_vec(),
+            // C++ default: all exponents = 1
+            None => vec![1u16; count],
+        };
+        if exps.len() != count {
+            exps.resize(count, 1);
+        }
+        self.shared.exponents_set.store(true, Ordering::Release);
+        self.shared.outputs_count.store(count, Ordering::Release);
+        self.exponents = exps.clone();
+        // a new recovery set marks a new processing round (multi-pass
+        // reuse) - clear the end-input latch
+        self.input_ended = false;
+        self.send(Cmd::SyncRecovery {
+            exponents: exps,
+            count,
+        })
+    }
+
+    fn free_mem(&mut self) -> Result<()> {
+        self.send(Cmd::FreeMem)
+    }
+
+    fn add_input(&mut self, buf: SliceBuf, input_index: i32, token: u64) -> Result<AddResult> {
+        if self.shared.closed.load(Ordering::Acquire) {
+            return Err(BackendError::new("Cannot add input after proc closed"));
+        }
+        if !self.shared.exponents_set.load(Ordering::Acquire) {
+            return Err(BackendError::new("Recovery slices not set"));
+        }
+        if buf.len > buf.data.len() {
+            return Err(BackendError::new("Input buffer length exceeds data"));
+        }
+        if buf.len as u64 > self.shared.current_slice_size.load(Ordering::Relaxed) {
+            return Err(BackendError::new("Input buffer too large"));
+        }
+        // a zero-size input is accepted but never completes - the C++
+        // backend refcount never reaches zero so no InputDone event fires
+        if buf.len == 0 {
+            return Ok(AddResult::Accepted);
+        }
+        // report a dead worker as an error rather than Full forever -
+        // pending never drains after a panic so staging never frees
+        if self.shared.worker_dead.load(Ordering::Acquire) {
+            return Err(BackendError::new("proc worker stopped"));
+        }
+        if !self.has_staging_room() {
+            return Ok(AddResult::Full(buf));
+        }
+        // input_diff table covers blocks 0..32768 (C++ accepts u16 but the
+        // table lookup requires < 32768)
+        if !(0..32768).contains(&input_index) {
+            return Err(BackendError::new("Input index out of range"));
+        }
+        let input_log = gfmat_input_log(input_index as u16);
+        let coeffs = self
+            .exponents
+            .iter()
+            .map(|&e| gfmat_coeff_from_log(input_log, e))
+            .collect();
+        // pack on the caller thread (mirrors prepare_packed inside the C++
+        // addInput) so the worker only does the multiply. Stage at the max
+        // allocated slice size like C++ staging; the work loop additionally
+        // clamps reads to packed.len() for grows after staging.
+        let mut packed = vec![0u8; packed_len(&*self.kernel, self.slice_size as usize)];
+        self.kernel.prepare(&mut packed, &buf.data[..buf.len]);
+        self.shared.pending.fetch_add(1, Ordering::AcqRel);
+        if let Err(e) = self.send(Cmd::Input(StagedInput {
+            buf,
+            input_index: input_index as i64,
+            token,
+            coeffs,
+            packed,
+        })) {
+            self.shared.pending.fetch_sub(1, Ordering::AcqRel);
+            return Err(e);
+        }
+        Ok(AddResult::Accepted)
+    }
+
+    fn end_input(&mut self, token: u64) -> Result<()> {
+        if self.shared.closed.load(Ordering::Acquire) {
+            return Err(BackendError::new("Cannot end input after proc closed"));
+        }
+        self.send(Cmd::End { token })?;
+        self.input_ended = true;
+        Ok(())
+    }
+
+    fn get_output(&mut self, output_index: i32, out: SliceBuf, token: u64) -> Result<()> {
+        if self.shared.closed.load(Ordering::Acquire) {
+            return Err(BackendError::new("Cannot get output after proc closed"));
+        }
+        let idx = output_index as usize;
+        if idx >= self.shared.outputs_count.load(Ordering::Acquire) {
+            return Err(BackendError::new("Invalid output index"));
+        }
+        self.send(Cmd::Output {
+            index: idx,
+            out,
+            token,
+        })
+    }
+
+    fn set_progress(&mut self, on: bool) -> Result<()> {
+        self.shared.progress_on.store(on, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn info(&mut self) -> Result<GfInfo> {
+        Ok(GfInfo {
+            cpu: Some(GfCpuInfo {
+                threads: self.shared.num_threads.load(Ordering::Relaxed),
+                method_desc: self.kernel.name().to_string(),
+                // synchronous caller-side packing: one chunk = the whole
+                // processing region
+                chunk_size: self.aligned_size() as u64,
+                staging_count: self.staging_limit as u32,
+                staging_size: self.input_batchsize as u64,
+                alignment: self.kernel.alignment() as u32,
+                stride: self.kernel.stride() as u64,
+                slice_mem: self.aligned_size() as u64,
+                num_output_slices: self.shared.outputs_count.load(Ordering::Relaxed) as i32,
+            }),
+            ocl: Vec::new(),
+        })
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.shared.closed.store(true, Ordering::Release);
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Cmd::Close);
+            drop(tx);
+        }
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+        // sentinel for any stale waiter - a wait on a closed proc must
+        // terminate rather than spin on an empty queue forever
+        if let Ok(mut q) = self.queues.lock() {
+            q.entry(self.proc_id)
+                .or_default()
+                .push_back(ProcEvent::Error {
+                    token: 0,
+                    message: "proc closed".into(),
+                });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoke() {
+        let q: EventQueues = Default::default();
+        let cpu = CpuSpec {
+            method: 0,
+            input_batchsize: 1,
+            input_minbatchsize: 1,
+            chunk_size: 0,
+            slice_offset: 0,
+            slice_size: 0,
+        };
+        let mut p = NativeGfProc::new(0, q.clone(), 64, Some(&cpu), 2).unwrap();
+        p.set_recovery_slices(None, 3).unwrap();
+        p.add_input(SliceBuf::new(vec![7u8; 64].into_boxed_slice(), 64), 0, 1)
+            .unwrap();
+        p.end_input(2).unwrap();
+        // default exponents are all 1 -> coeff = g^(1*1) = 2 -> 2*input;
+        // outputs are stored packed - read back through get_output, which
+        // delivers the filled buffer via an OutputDone event
+        let out = SliceBuf::new(vec![0u8; 64].into_boxed_slice(), 64);
+        p.get_output(0, out, 9).unwrap();
+        let mut events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while events.len() < 3 && Instant::now() < deadline {
+            if let Some(e) = p.wait_own_event(Duration::from_millis(50)) {
+                events.push(e);
+            }
+        }
+        assert_eq!(events.len(), 3);
+        let mut saw = false;
+        for e in events {
+            if let ProcEvent::OutputDone { buf, .. } = e {
+                assert_eq!(&buf.data[..8], &[14u8; 8]);
+                saw = true;
+            }
+        }
+        assert!(saw);
+    }
+
+    /// input_index indexes a 32768-entry gf matrix - values >= 32768 must
+    /// error, not panic the worker mid-coefficient-lookup
+    #[test]
+    fn input_index_out_of_range_errors() {
+        let q: EventQueues = Default::default();
+        let cpu = CpuSpec {
+            method: 0,
+            input_batchsize: 1,
+            input_minbatchsize: 1,
+            chunk_size: 0,
+            slice_offset: 0,
+            slice_size: 0,
+        };
+        let mut p = NativeGfProc::new(0, q.clone(), 64, Some(&cpu), 2).unwrap();
+        p.set_recovery_slices(None, 3).unwrap();
+        let mk = || SliceBuf::new(vec![1u8; 64].into_boxed_slice(), 64);
+        assert!(p.add_input(mk(), 32768, 1).is_err());
+        assert!(p.add_input(mk(), 40000, 2).is_err());
+        // the boundary value is still valid
+        assert!(matches!(
+            p.add_input(mk(), 32767, 3).unwrap(),
+            AddResult::Accepted
+        ));
+    }
+
+    /// add_input with a buf.len larger than the slice size must error
+    /// before prepare() can slice out of bounds
+    #[test]
+    fn oversized_input_errors() {
+        let q: EventQueues = Default::default();
+        let cpu = CpuSpec {
+            method: 0,
+            input_batchsize: 1,
+            input_minbatchsize: 1,
+            chunk_size: 0,
+            slice_offset: 0,
+            slice_size: 0,
+        };
+        let mut p = NativeGfProc::new(0, q.clone(), 64, Some(&cpu), 2).unwrap();
+        p.set_recovery_slices(None, 3).unwrap();
+        assert!(p
+            .add_input(SliceBuf::new(vec![1u8; 128].into_boxed_slice(), 128), 0, 1)
+            .is_err());
+        // buf.len exceeding buf.data.len() is invalid too (constructed
+        // manually - SliceBuf::new debug_asserts against it)
+        assert!(p
+            .add_input(
+                SliceBuf {
+                    data: vec![1u8; 32].into_boxed_slice(),
+                    len: 64
+                },
+                0,
+                2
+            )
+            .is_err());
+    }
+
+    /// get_output after free_mem must not panic - C++ returns a zeroed
+    /// buffer with cksum_valid=false semantics
+    #[test]
+    fn output_after_free_mem_no_panic() {
+        let q: EventQueues = Default::default();
+        let cpu = CpuSpec {
+            method: 0,
+            input_batchsize: 1,
+            input_minbatchsize: 1,
+            chunk_size: 0,
+            slice_offset: 0,
+            slice_size: 0,
+        };
+        let mut p = NativeGfProc::new(0, q.clone(), 64, Some(&cpu), 2).unwrap();
+        p.set_recovery_slices(None, 3).unwrap();
+        p.free_mem().unwrap();
+        let out = SliceBuf::new(vec![0u8; 64].into_boxed_slice(), 64);
+        p.get_output(0, out, 7).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match p.wait_own_event(Duration::from_millis(50)) {
+                Some(ProcEvent::OutputDone { cksum_valid, .. }) => {
+                    assert!(!cksum_valid);
+                    break;
+                }
+                Some(ProcEvent::Error { message, .. }) => {
+                    panic!("unexpected error: {}", message)
+                }
+                _ => assert!(Instant::now() < deadline, "timed out"),
+            }
+        }
+    }
+}

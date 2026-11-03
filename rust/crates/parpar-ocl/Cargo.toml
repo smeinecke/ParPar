@@ -1,0 +1,14 @@
+[package]
+name = "parpar-ocl"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Minimal OpenCL FFI bindings for ParPar (dlopen-based, optional)"
+
+[dependencies]
+parpar-backend = { path = "../parpar-backend" }
+parpar-gf16 = { path = "../parpar-gf16" }
+
+# FFI oracle links only on gnu targets
+[target.'cfg(target_env = "gnu")'.dev-dependencies]
+parpar-ffi = { path = "../parpar-ffi" }

@@ -1,0 +1,193 @@
+# Differential cases: `name | argv`. Comment lines start with #.
+basic              | -o out.par2 -s 10k -r 20% test/dump_args.js
+defaults           | -o out.par2 test/dump_args.js
+aliases            | -o out -s 64k -r 10 -e 5 -c "a comment" -f keep -B base -O -n -d equal -p 100 -F 3 -m 1G -t 4 -R -L -q test/dump_args.js
+bool-negate        | -o out --no-unicode --no-index test/dump_args.js
+recurse-bool       | -o out --recurse test/dump_args.js
+recurse-depth      | -o out --recurse=3 test/dump_args.js
+recurse-no         | -o out --no-recurse test/dump_args.js
+slice-expr-count   | -o out -s 2000 test/dump_args.js
+slice-expr-max     | -o out -s 2000 --max-input-slices 1M test/dump_args.js
+slice-expr-minmax  | -o out -s 64k --min-input-slices 32k --max-input-slices 2M test/dump_args.js
+slice-mult         | -o out -s 1024 --slice-size-multiple 16k test/dump_args.js
+slice-auto         | -o out -S -s 64k test/dump_args.js
+slice-l            | -o out -s '1l*2' test/dump_args.js
+slice-w            | -o out -s '4w' test/dump_args.js
+slice-o-n          | -o out -s '2o+1n/2' test/dump_args.js
+slice-sml          | -o out -s '1s*4' test/dump_args.js
+slice-expr-minus   | -o out -s '1M-2k' test/dump_args.js
+slice-expr-neg     | -o out -s '-2k' test/dump_args.js
+slice-expr-plusmin | -o out -s '64k+-2k--1k' test/dump_args.js
+rec-count          | -o out -r 50 test/dump_args.js
+rec-ratio          | -o out -r 12.5% test/dump_args.js
+rec-expr           | -o out -r '10%+5-2' test/dump_args.js
+rec-neg            | -o out -r=-5 test/dump_args.js
+rec-minmax         | -o out -r 10% --min-recovery-slices 5 --max-recovery-slices 20% test/dump_args.js
+rec-exp            | -o out -r 10 --recovery-exponents 0,1,2 test/dump_args.js
+rec-offset         | -o out -r 10 -e 3 test/dump_args.js
+spf                | -o out -r 10 -p '2w' test/dump_args.js
+spf-round          | -o out -r 10 -p '<100' --slices-first-file '>10' test/dump_args.js
+recovery-files     | -o out -r 10 -F 5 test/dump_args.js
+packet-pow2        | -o out --packet-redundancy pow2 test/dump_args.js
+packet-none        | -o out --packet-redundancy none test/dump_args.js
+packet-spec        | -o out --packet-redundancy '4+2' test/dump_args.js
+packet-minmax      | -o out --min-packet-redundancy 2 --max-packet-redundancy 16 test/dump_args.js
+comments-multi     | -o out -c one -c two -c three test/dump_args.js
+filepath-outrel    | -o out -f outrel -B /tmp test/dump_args.js
+filepath-path      | -o out -f path test/dump_args.js
+charset            | -o out --ascii-charset utf-16 test/dump_args.js
+charset-bad        | -o out --ascii-charset bogus-enc test/dump_args.js
+overwrite          | -o out -O --write-sync test/dump_args.js
+naming-no          | -o out -n test/dump_args.js
+noindex-off        | -o out --no-noindex test/dump_args.js
+slicedeep          | -o out -s '1l/2' test/dump_args.js
+memory-limit       | -o out -m 500M test/dump_args.js
+mem-zero           | -o out -m 0 test/dump_args.js
+threads            | -o out -t 8 test/dump_args.js
+threads-neg        | -o out -t=-2 test/dump_args.js
+chunk-opts         | -o out --min-chunk-size 2M --seq-read-size 8M --chunk-read-threads 3 test/dump_args.js
+read-throttle      | -o out --seq-read-throttle '10M/s' --chunk-read-throttle 'k/2s' test/dump_args.js
+throttle-delay     | -o out --seq-read-throttle '500ms' test/dump_args.js
+throttle-req       | -o out --seq-read-throttle '10r/1s' test/dump_args.js
+throttle-zero      | -o out --seq-read-throttle 0 test/dump_args.js
+throttle-empty     | -o out --seq-read-throttle 'r/1s' test/dump_args.js
+buffers            | -o out --read-buffers 4 --read-hash-queue 8 --proc-batch-size 16 --md5-batch-size 32 --recovery-buffers 2 test/dump_args.js
+method             | -o out --method xorjit test/dump_args.js
+gf-opts            | -o out --loop-tile-size 1M --cpu-minchunk 64k test/dump_args.js
+hash-methods       | -o out --hash-method simd --md5-method multi test/dump_args.js
+opencl-ratio       | -o out --opencl-process 50% test/dump_args.js
+opencl-ratio-num   | -o out --opencl-process 0.25 test/dump_args.js
+opencl-devnum      | -o out --opencl-process 0.5 --opencl-device 0:0 test/dump_args.js
+opencl-devpart     | -o out --opencl-process 0.5 --opencl-device 0: test/dump_args.js
+opencl-mem         | -o out --opencl-process 0.5 --opencl-memory 2G --opencl-minchunk 64k test/dump_args.js
+opencl-misc        | -o out --opencl-process 0.5 --opencl-method shuffle --opencl-batch-size 4 --opencl-iter-count 8 --opencl-grouping 2 test/dump_args.js
+opencl-listentry   | -o out --opencl 'device=0:0,process=25%' test/dump_args.js
+opencl-two         | -o out --opencl 'device=0:0,process=25%' --opencl 'process=10%,memory=1G' test/dump_args.js
+opencl-inherit     | -o out --opencl-device 0:0 --opencl 'process=50%' --opencl 'process=25%,memory=1G' test/dump_args.js
+opencl-name        | -o out --opencl 'device=NVIDIA GeForce RTX 2080,process=50%' test/dump_args.js
+opencl-name-global | -o out --opencl-device 'NVIDIA GeForce RTX 2080' --opencl 'process=50%' test/dump_args.js
+opencl-name-same   | -o out --opencl-device 'NVIDIA GeForce RTX 2080' --opencl 'device=NVIDIA GeForce RTX 2080,process=50%' test/dump_args.js
+opencl-name-miss   | -o out --opencl 'device=No Such GPU,process=50%' test/dump_args.js
+opencl-name-badkey | -o out --opencl 'novalue' test/dump_args.js
+out-par2-strip     | -o MYOUT.PAR2 test/dump_args.js
+out-nopar2         | -o outname test/dump_args.js
+err-no-out         | test/dump_args.js
+err-no-input       | -o out.par2
+err-dup            | -o a -o b test/dump_args.js
+err-dup-bool       | -o out -q -q test/dump_args.js
+err-unknown        | -o out --frobnicate test/dump_args.js
+err-noval          | -o out --memory test/dump_args.js
+err-bad-int        | -o out --threads=xyz test/dump_args.js
+err-neg-int        | -o out --threads=-3 test/dump_args.js
+err-size           | -o out --memory=zz test/dump_args.js
+err-time           | -o out --seq-read-throttle 'x/y' test/dump_args.js
+err-enum           | -o out --slice-dist bogus test/dump_args.js
+err-ambig          | -o out -qn test/dump_args.js
+err-slice-big      | -o out -s 40000 test/dump_args.js
+err-slice-bad      | -o out -s l*2 test/dump_args.js
+err-slice-neg      | -o out -s=-5 test/dump_args.js
+err-no-dashval     | -o out --e -5 test/dump_args.js
+err-ambig-short    | -o out -n-5 test/dump_args.js
+err-short-unknown  | -o out -z test/dump_args.js
+dashdash           | -o out -- test/dump_args.js -r
+eq-blank           | -o out --memory= test/dump_args.js
+eq-blank-str       | -o out --method= test/dump_args.js
+input-file-list    | -o out -i test/dump_args.js
+input-file0        | -o out -0 test/dump_args.js
+quiet-progress     | -o out -q --progress none test/dump_args.js
+json-flag          | -o out --json test/dump_args.js
+skip-self-check    | -o out --skip-self-check test/dump_args.js
+unicode-flag       | -o out --unicode test/dump_args.js
+stdname-false      | -o out --no-std-naming test/dump_args.js
+list-lf            | -o out -s 10k -i test/fixtures/list_lf.txt
+list-nul           | -o out -s 10k -0 test/fixtures/list_nul.txt
+list-latin1        | -o out -s 10k --input-file-enc latin1 -i test/fixtures/list_latin1.txt
+list-nonl          | -o out -s 10k -i test/fixtures/list_nonl.txt
+list-multi         | -o out -s 10k -i test/fixtures/list_lf.txt -i test/fixtures/list_nonl.txt positional
+list-mixed         | -o out -s 10k -i test/fixtures/list_lf.txt -0 test/fixtures/list_nul.txt pos
+err-list-missing   | -o out -s 10k -i /nonexistent_file_xyz
+err-list-dir       | -o out -s 10k -i /tmp
+list-proc          | -o out -s 10k -i 'proc://echo test/dump_args.js'
+list-proc-sh       | -o out -s 10k -i 'proc://printf "a\nb\n"'
+fd-upper           | -o out -s 10k -i 'FD://999999'
+fd-bare            | -o out -s 10k -i 'fd://'
+fd-nondigit        | -o out -s 10k -i 'fd://x'
+no-comment         | -o out -s 10k --no-comment test/dump_args.js
+comment-blank      | -o out -s 10k --comment= test/dump_args.js
+comment-empty-str  | -o out -s 10k -c '' test/dump_args.js
+fpbase-only        | -o out -s 10k -B /some/base test/dump_args.js
+fpbase-fmt-blank   | -o out -s 10k -B /some/base --filepath-format= test/dump_args.js
+exp-conflict-r     | -o out -s 10k -r 10 --recovery-exponents 1,2 test/dump_args.js
+exp-conflict-off   | -o out -s 10k -e 1 --recovery-exponents 1,2 test/dump_args.js
+exp-conflict-noix  | -o out -s 10k --noindex --recovery-exponents 1,2 test/dump_args.js
+exp-ok             | -o out -s 10k --recovery-exponents 0,2,4 test/dump_args.js
+exp-noval          | -o out -s 10k --recovery-exponents test/dump_args.js
+help-alias         | -?
+help-long          | --help
+version-flag       | --version
+opencl-list-exit   | --opencl-list
+opencl-list-all    | --opencl-list=all
+spf-ratio          | -o out -s 10k -r 10 -p '5%' test/dump_args.js
+rec-largest        | -o out -s 10k -r '1l*2' test/dump_args.js
+offset-neg         | -o out -s 10k -e=-3 test/dump_args.js
+out-blank          | -o '' -s 10k test/dump_args.js
+out-eq-blank       | --out= -s 10k test/dump_args.js
+unicode-yes        | -o out -s 10k --unicode test/dump_args.js
+unicode-no         | -o out -s 10k --no-unicode test/dump_args.js
+bundle-bool        | -o out -s 10k -ORL test/dump_args.js
+bundle-bool-q      | -o out -s 10k -qO test/dump_args.js
+short-eq           | -o out -s=10k test/dump_args.js
+slice-32768        | -o out -s 32768 test/dump_args.js
+slice-32769        | -o out -s 32769 test/dump_args.js
+slice-32768b       | -o out -s 32768b test/dump_args.js
+opencl-kv-empty    | -o out -s 10k --opencl 'device=' test/dump_args.js
+opencl-emptykey    | -o out -s 10k --opencl '=v' test/dump_args.js
+opencl-doubleeq    | -o out -s 10k --opencl 'device=0=1' test/dump_args.js
+opencl-global-only | -o out -s 10k --opencl-device 0:0 test/dump_args.js
+opencl-method-only | -o out -s 10k --opencl-method xor test/dump_args.js
+input-slices-l2    | -o out -s '2l' test/dump_args.js
+slice-min-l        | -o out -s 64k --min-input-slices '1l*2' test/dump_args.js
+slice-max-s        | -o out -s 64k --max-input-slices '1s/4' test/dump_args.js
+noinput-pos-only   | -o out -s 10k just-a-positional
+quiet-progress     | -o out -s 10k -q test/dump_args.js
+progress-none      | -o out -s 10k --progress none test/dump_args.js
+progress-stdout    | -o out -s 10k --progress stdout test/dump_args.js
+progress-bad       | -o out -s 10k --progress bogus test/dump_args.js
+threads-bound      | -o out -s 10k -t 0 test/dump_args.js
+threads-wrap       | -o out -s 10k -t 4294967297 test/dump_args.js
+offset-wrap        | -o out -s 10k -e 4294967297 test/dump_args.js
+mem-tb             | -o out -s 10k -m 2T test/dump_args.js
+mem-frac           | -o out -s 10k -m 1.5G test/dump_args.js
+mem-eb             | -o out -s 10k -m 1E test/dump_args.js
+slice-pe           | -o out -s 1P test/dump_args.js
+slice-eb           | -o out -s 1E test/dump_args.js
+fd-stdin           | -o out -s 10k -i 'fd://0'
+list-stdin-empty   | -o out -s 10k -i -
+list-stdin-dup     | -o out -s 10k -i - -i -
+list-stdin-dupmix  | -o out -s 10k -i - -0 -
+bundle-ambig-s     | -o out -qs10k test/dump_args.js
+bundle-qs-n        | -o out -qn -s10k test/dump_args.js
+short-attached     | -o out -s10k -r20% test/dump_args.js
+short-eq-val       | -o=out -s=10k test/dump_args.js
+help-over-version  | --version --help
+help-full-short    | --help --help-full
+help-full-only     | --help-full
+ocl-over-version   | --version --opencl-list
+ocl-plus-help      | --opencl-list --help
+ver-with-json      | --version --json
+json-before-ver    | --json --version
+quiet-json-clash   | -o out -s 10k -q --json test/dump_args.js
+exp-neg-values     | -o out -s 10k --recovery-exponents 'a,B,c' test/dump_args.js
+list-case-fold     | -o out -s 10k --recovery-exponents 'AA, bb' test/dump_args.js
+map-opencl-spaces  | -o out -s 10k --opencl ' device = 0:0 , process = 50% ' test/dump_args.js
+slices-first-pct   | -o out -s 10k -r 10 --slices-first-file '8%' test/dump_args.js
+nonum-l-w-slash    | -o out -s '1l/4' -r 10 test/dump_args.js
+weird-case-opt     | -o OUT -S 64K -R 10% test/dump_args.js
+long-opt-case      | -o out -s 10k --ReCuRsE=3 test/dump_args.js
+no-prefix-multi    | -o out -s 10k --no-input-file test/dump_args.js
+no-prefix-single   | -o out -s 10k --no-memory test/dump_args.js
+no-prefix-str      | -o out -s 10k --no-method test/dump_args.js
+negate-then-val    | -o out -s 10k --no-comment -c hi test/dump_args.js
+val-then-negate    | -o out -s 10k -c hi --no-comment test/dump_args.js
+dup-map            | -o out -s 10k --opencl 'device=0:0' --opencl 'device=0:0' test/dump_args.js
+out-slash-suffix   | -o dir/sub.name.PAR2 -s 10k test/dump_args.js

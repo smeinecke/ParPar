@@ -1,0 +1,28 @@
+{
+  "reference": {
+    "repository": "https://github.com/animetosho/ParPar.git",
+    "commit": "f4fe1cee823b77da4bb04a8fb122fb0082917518",
+    "package_version": "0.4.6",
+    "creator_template": "ParPar v0.4.6 {node_arch} [https://github.com/animetosho/parpar]"
+  },
+  "profile": {
+    "name": "stefan-linux-x64",
+    "node": "v24.15.0",
+    "node_arch": "x64",
+    "async_version": "2.6.4",
+    "os": "linux",
+    "arch": "x86_64",
+    "cpu": "AMD Ryzen 7 5800X 8-Core Processor",
+    "buffer_kMaxLength": 9007199254740991,
+    "constrained_memory": null,
+    "gf_auto_method": 19,
+    "hasher_input_auto": "BMI1+PCLMUL",
+    "hasher_output_auto": "AVX2",
+    "opencl": "NVIDIA CUDA / NVIDIA GeForce RTX 2080"
+  },
+  "notes": [
+    "buffer.kMaxLength and constrainedMemory() are runtime-profile values, not universal constants",
+    "The solver's 64-bit check uses node_arch names (arm64|ppc64|x64), not pointer width",
+    "Creator string uses the package.json version of the reference build"
+  ]
+}

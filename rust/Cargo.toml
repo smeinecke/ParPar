@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/parpar",
+    "crates/parpar-backend",
+    "crates/parpar-gf16",
+    "crates/parpar-hasher",
+    "crates/parpar-ocl",
+    "crates/parpar-sys",
+    "crates/parpar-ffi",
+]
+
+[workspace.package]
+edition = "2021"
+# floor is the AVX512 intrinsics stabilization release (1.89); aarch64
+# feature detection and NEON sha3 intrinsics are stable well below it
+rust-version = "1.89"
+license = "CC0-1.0"
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,0 +1,10 @@
+[package]
+name = "parpar-ffi"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Safe adapter implementing parpar-backend over the C++ FFI shim"
+
+[dependencies]
+parpar-sys = { path = "../parpar-sys" }
+parpar-backend = { path = "../parpar-backend" }

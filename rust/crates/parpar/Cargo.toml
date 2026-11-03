@@ -1,0 +1,38 @@
+[package]
+name = "parpar"
+version = "0.4.6"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "High performance multi-threaded PAR2 creation tool"
+default-run = "parpar"
+
+[features]
+# `ffi` links the C++ reference backend (parpar-ffi -> parpar-sys) as the
+# migration oracle + PARPAR_FORCE_FFI escape hatch. Default-on during
+# coexistence; `--no-default-features` builds a pure-Rust binary.
+default = ["ffi"]
+ffi = ["dep:parpar-ffi"]
+
+[dependencies]
+libc = "0.2.191"
+md-5 = "0.10.6"
+parpar-backend = { path = "../parpar-backend" }
+parpar-gf16 = { path = "../parpar-gf16" }
+parpar-ffi = { path = "../parpar-ffi", optional = true }
+parpar-ocl = { path = "../parpar-ocl" }
+parpar-hasher = { path = "../parpar-hasher" }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+
+[target.'cfg(target_env = "gnu")'.dev-dependencies]
+# differential tests use the reference backend as oracle regardless of the
+# production `ffi` feature; the oracle only links on gnu targets
+parpar-ffi = { path = "../parpar-ffi" }
+
+[[bin]]
+name = "parpar"
+path = "src/main.rs"
+
+[[example]]
+name = "gen128"
+required-features = ["ffi"]

@@ -1,0 +1,24 @@
+# Cross-architecture test configuration.
+# musl targets link fully self-contained via rust-lld (no cross toolchain
+# needed) and run under extracted qemu-user binaries:
+#   apt-get download qemu-user && dpkg-deb -x qemu-user_*.deb /tmp/qemu-user/root
+# QEMU_LD_PREFIX=/tmp/qemu-user/root lets the runners resolve the binary's
+# own loader; musl test binaries are static so no sysroot libs are needed.
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+runner = ["/tmp/qemu-user/root/usr/bin/qemu-aarch64", "-L", "/tmp/qemu-user/root"]
+
+[target.riscv64gc-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]
+runner = ["/tmp/qemu-user/root/usr/bin/qemu-riscv64", "-cpu", "rv64,v=true", "-L", "/tmp/qemu-user/root"]
+
+# Static x86_64 musl builds for distribution (self-contained via rust-lld,
+# same mechanism as the aarch64/riscv cross targets above).
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+
+# qemu-x86_64 can emulate ISA extensions the host lacks; AVX512/GFNI are NOT
+# supported by QEMU TCG (even v11), so no runner is set here - native tests
+# dispatch on hardware features only.

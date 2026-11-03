@@ -1,0 +1,12 @@
+[package]
+name = "parpar-sys"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+description = "Raw FFI bindings to the ParPar C++ compute backend (transitional)"
+links = "parpar_native"
+
+[features]
+default = ["opencl"]
+opencl = []
