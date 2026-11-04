@@ -654,9 +654,8 @@ impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
                 Ok(mut data) => {
                     let fidx = data.file_index;
                     if first {
-                        let buf = data.buffer.clone();
                         let f = &mut self.gen.par2.files[fidx];
-                        if let Err(e) = f.process_hash(&buf) {
+                        if let Err(e) = f.process_hash(&data.buffer) {
                             res = Err(e.to_string());
                             return;
                         }
@@ -738,6 +737,24 @@ impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
                                 "Data read failure: read {} bytes ({} slices) but expected {} slices",
                                 data.buffer.len(), num_slices, expected
                             ));
+                            return;
+                        }
+                        // zero-copy fast path: a read that is exactly one
+                        // slice (readSize == sliceSize, the common large-slice
+                        // case) hands the buffer over instead of memcpy'ing
+                        // it out - multi-slice reads still slice out copies
+                        if num_slices == 1 && data.buffer.len() == slice_size as usize {
+                            cb_progress(Progress::ProcessingSlice(fidx, slice_pos));
+                            let len = data.buffer.len();
+                            let buf =
+                                SliceBuf::new(std::mem::take(&mut data.buffer).into_boxed_slice(), len);
+                            let f = &mut self.gen.par2.files[fidx];
+                            let gen = &mut self.gen.par2.gen;
+                            if let Err(e) = f.process_data(gen, buf) {
+                                res = Err(e.to_string());
+                                return;
+                            }
+                            data.release();
                             return;
                         }
                         for i in 0..num_slices {

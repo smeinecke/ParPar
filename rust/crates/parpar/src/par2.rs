@@ -662,6 +662,13 @@ pub trait GfCtx {
     ) -> Result<Self::Proc>;
     /// Wait for the next event belonging to `proc_id`.
     fn wait_for(&mut self, proc_id: usize) -> Result<ProcEvent>;
+    /// Single non-blocking poll of `proc_id`'s mailbox. `wait_event(0)`
+    /// polls once and returns immediately - used to drain InputDone
+    /// buffers during the add loop so emitted-but-unconsumed events do
+    /// not retain the whole input in memory.
+    fn try_wait_for(&mut self, _proc_id: usize) -> Result<Option<ProcEvent>> {
+        Ok(None)
+    }
     fn new_output_hasher(&mut self, regions: u32) -> Result<Box<dyn HasherOutput>>;
     fn new_input_hasher(
         &mut self,
@@ -805,6 +812,31 @@ where
                 .wait_event(-1)
                 .ok_or_else(|| BackendError::new("backend event queue closed"))?;
             inner.stash.entry(pid).or_default().push_back(ev);
+        }
+    }
+
+    fn try_wait_for(&mut self, proc_id: usize) -> Result<Option<ProcEvent>> {
+        let mut inner = self.inner.borrow_mut();
+        if inner.native_pids.contains(&proc_id) {
+            let mut nq = inner.native_queues.lock().unwrap();
+            return Ok(nq.get_mut(&proc_id).and_then(|q| q.pop_front()));
+        }
+        if let Some(q) = inner.stash.get_mut(&proc_id) {
+            if let Some(ev) = q.pop_front() {
+                return Ok(Some(ev));
+            }
+        }
+        // single poll of the backend queue; an event for another proc is
+        // stashed for its owner rather than consumed
+        match inner.backend.wait_event(0) {
+            Some((pid, ev)) => {
+                inner.stash.entry(pid).or_default().push_back(ev);
+                Ok(inner
+                    .stash
+                    .get_mut(&proc_id)
+                    .and_then(|q| q.pop_front()))
+            }
+            None => Ok(None),
         }
     }
 
@@ -1086,12 +1118,24 @@ impl<C: GfCtx> RecoveryGen<C> {
             .ok_or_else(|| BackendError::new("GF context not initialised"))?
             .add_input(buf, slice_num as i32, t)?
         {
-            AddResult::Accepted => Ok(()),
+            AddResult::Accepted => self.drain_ready(),
             AddResult::Full(b) => {
                 self.add_queue.push_back(AddItem { slice_num, buf: b });
                 self.pump_adds()
             }
         }
+    }
+
+    /// Drain already-queued events without blocking. Emitted InputDone
+    /// events carry their input buffer - if they pile up unconsumed the
+    /// mailbox retains the whole input (JS consumed events on the event
+    /// loop continuously). Called after each successful add to keep the
+    /// queue shallow.
+    fn drain_ready(&mut self) -> Result<()> {
+        while let Some(ev) = self.ctx.try_wait_for(self.proc_id)? {
+            self.handle_event(ev)?;
+        }
+        Ok(())
     }
 
     /// Retry queue head on each staging-freeing event until drained -
@@ -1127,6 +1171,12 @@ impl<C: GfCtx> RecoveryGen<C> {
     /// dispatch). Returns when an event was consumed.
     fn pump_one(&mut self) -> Result<()> {
         let ev = self.ctx.wait_for(self.proc_id)?;
+        self.handle_event(ev)
+    }
+
+    /// Event routing shared by the blocking pump and the non-blocking
+    /// drain.
+    fn handle_event(&mut self, ev: ProcEvent) -> Result<()> {
         match ev {
             ProcEvent::InputDone { buf, .. } => {
                 // JS invokes the submitter's callback to release the buffer;

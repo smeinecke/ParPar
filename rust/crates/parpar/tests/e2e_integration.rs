@@ -212,7 +212,8 @@ fn js_cli() -> Option<std::path::PathBuf> {
             return Some(p);
         }
     }
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bin/parpar.js");
+    // CARGO_MANIFEST_DIR = rust/crates/parpar -> repo root is ../../..
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../bin/parpar.js");
     p.exists().then_some(p)
 }
 
@@ -546,5 +547,70 @@ fn cli_error_parity() {
             String::from_utf8_lossy(&js_out.stderr),
             String::from_utf8_lossy(&rs_out.stderr)
         );
+    }
+}
+
+/// Regression: the CLI used to drop the GenOpts default
+/// max_recovery_slices {slices:65536}, so any non-integral -r spec
+/// (percent, bytes, power, file-based) failed with "Could not satisfy
+/// min/max recovery slice count constraints". Drives the real binaries
+/// and requires byte-identical output.
+#[test]
+fn cli_recovery_specs() {
+    let Some(js) = js_cli() else {
+        eprintln!("node/JS CLI unavailable - skipping CLI spec parity");
+        return;
+    };
+    let rust_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_parpar"));
+    let dir = std::env::temp_dir().join("e2e_clispec");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("in.bin"), vec![0xabu8; 100_000]).unwrap();
+
+    for rspec in ["10%", "2K", "0.5w"].iter() {
+        let js_out = std::process::Command::new("node")
+            .arg(&js)
+            .args(["-q", "-O", "-s4K", "-r"])
+            .arg(rspec)
+            .args(["-o", "js", "in.bin"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let rs_out = std::process::Command::new(&rust_bin)
+            .args(["-q", "-O", "-s4K", "-r"])
+            .arg(rspec)
+            .args(["-o", "rs", "in.bin"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert_eq!(
+            js_out.status.code(),
+            rs_out.status.code(),
+            "-r{rspec}: exit differs (js={:?} rust={:?})\nrs stderr: {}",
+            js_out.status.code(),
+            rs_out.status.code(),
+            String::from_utf8_lossy(&rs_out.stderr)
+        );
+        assert!(
+            rs_out.status.success(),
+            "-r{rspec}: rust CLI failed\n{}",
+            String::from_utf8_lossy(&rs_out.stderr)
+        );
+        // every generated file must be byte-identical to the JS oracle's
+        for ent in std::fs::read_dir(&dir).unwrap() {
+            let name = ent.unwrap().file_name().into_string().unwrap();
+            if let Some(rest) = name.strip_prefix("js") {
+                let ours = dir.join(format!("rs{rest}"));
+                assert!(
+                    ours.exists(),
+                    "-r{rspec}: missing output {ours:?} for js file {name}"
+                );
+                assert_eq!(
+                    std::fs::read(dir.join(&name)).unwrap(),
+                    std::fs::read(&ours).unwrap(),
+                    "-r{rspec}: {name} differs"
+                );
+            }
+        }
     }
 }

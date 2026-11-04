@@ -2226,7 +2226,12 @@ impl GenOpts {
             o.recovery_slices = e.clone();
         }
         o.min_recovery_slices = min_recovery_slices.clone();
-        o.max_recovery_slices = max_recovery_slices.clone();
+        // GenOpts default is {slices:65536} - only an explicit
+        // --max-recovery-slices may replace it; assigning None would drop
+        // the ceiling and fail any non-integral -r spec
+        if let Some(m) = max_recovery_slices {
+            o.max_recovery_slices = Some(m.clone());
+        }
         if let Some(v) = ppo.recovery_offset {
             o.recovery_offset = v;
         }

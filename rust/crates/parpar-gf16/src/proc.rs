@@ -733,13 +733,20 @@ impl GfProc for NativeGfProc {
     }
 
     fn info(&mut self) -> Result<GfInfo> {
+        // report the loop tiling like C++ getChunkLen(): the configured
+        // loopTileSize, or the kernel's idealChunkSize when auto (0) -
+        // not the whole aligned region
+        let ideal = crate::kernel::method_info(self.kernel.id()).target_chunk;
+        let tile = if self.chunk_size > 0 {
+            self.chunk_size as u64
+        } else {
+            ideal
+        };
         Ok(GfInfo {
             cpu: Some(GfCpuInfo {
                 threads: self.shared.num_threads.load(Ordering::Relaxed),
                 method_desc: self.kernel.name().to_string(),
-                // synchronous caller-side packing: one chunk = the whole
-                // processing region
-                chunk_size: self.aligned_size() as u64,
+                chunk_size: tile,
                 staging_count: self.staging_limit as u32,
                 staging_size: self.input_batchsize as u64,
                 alignment: self.kernel.alignment() as u32,
