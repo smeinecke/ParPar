@@ -21,8 +21,9 @@ jobs:
           - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  slug: linux-glibc-amd64 }
           - { os: ubuntu-latest,    target: x86_64-unknown-linux-musl, slug: linux-musl-amd64 }
           # aarch64 + riscv64 cross-compile self-contained via rust-lld
-          - { os: ubuntu-latest,    target: aarch64-unknown-linux-musl, slug: linux-musl-arm64 }
-          - { os: ubuntu-latest,    target: riscv64gc-unknown-linux-musl, slug: linux-musl-riscv64 }
+          # (cross: binary cannot execute on the x86_64 build runner)
+          - { os: ubuntu-latest,    target: aarch64-unknown-linux-musl, slug: linux-musl-arm64, cross: true }
+          - { os: ubuntu-latest,    target: riscv64gc-unknown-linux-musl, slug: linux-musl-riscv64, cross: true }
           # native ARM runner for the aarch64 glibc binary
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, slug: linux-glibc-arm64 }
           # macOS both arches, Windows x86_64
@@ -46,6 +47,7 @@ jobs:
         run: cargo build --release --no-default-features --target ${{ matrix.target }} -p parpar
         working-directory: rust
       - name: smoke test
+        if: matrix.cross != true
         shell: bash
         run: target/${{ matrix.target }}/release/parpar${{ runner.os == 'Windows' && '.exe' || '' }} --help | head -3
         working-directory: rust
