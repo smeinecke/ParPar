@@ -337,7 +337,12 @@ pub fn pick_explicit(method_id: i32) -> Option<Box<dyn GfKernel>> {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         match method_id {
-            0 | 1 | 2 | 3 => Some(pick(method_id)),
+            0 => Some(pick(0)),
+            m if m == method::LOOKUP => Some(Box::new(Lookup)),
+            // report the method-table names like the other arch fallbacks
+            // so kernel_meta parity holds on scalar-only targets
+            2 => Some(renamed(Lookup, 2, "Lookup (SSE2)")),
+            3 => Some(renamed(Lookup, 3, "3-part Lookup")),
             _ => None,
         }
     }

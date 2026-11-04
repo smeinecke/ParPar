@@ -19,7 +19,7 @@ jobs:
           # Other platforms exercise the pure-Rust crates only - the C++
           # oracle build (parpar-sys/cmake) is Linux-only for now
           - { os: macos-latest,   target: aarch64-apple-darwin, ffi: '' }
-          - { os: macos-13,       target: x86_64-apple-darwin, ffi: '' }
+          - { os: macos-15-intel, target: x86_64-apple-darwin, ffi: '' }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, ffi: '' }
     name: cargo test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -32,6 +32,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      - name: install libuv (C++ oracle dependency)
+        if: matrix.ffi == '1'
+        run: sudo apt-get update && sudo apt-get install -y libuv1-dev
       - name: cargo test --workspace (with C++ oracle)
         if: matrix.ffi == '1'
         run: cargo test --workspace --all-targets
@@ -61,6 +64,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      # gnu dev-deps build the C++ oracle (parpar-sys) which needs libuv
+      - run: sudo apt-get update && sudo apt-get install -y libuv1-dev
       - run: cargo test -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl
         working-directory: rust
       - run: cargo build --release --no-default-features -p parpar
@@ -82,8 +87,12 @@ jobs:
         working-directory: rust
       - name: no C++ runtime linkage
         run: |
-          ! ldd target/release/parpar | grep -E 'libstdc\+\+|libgcc|libuv'
-          ! cargo tree --no-default-features -p parpar | grep -E 'parpar-sys|parpar-ffi'
+          # libgcc_s is the Rust unwinder, not the C++ runtime - only
+          # libstdc++/libuv signal an unwanted C++ dependency. cargo tree
+          # counts dev-deps (parpar-ffi is a gnu dev-dep) so restrict to
+          # normal edges.
+          ! ldd target/release/parpar | grep -E 'libstdc\+\+|libuv'
+          ! cargo tree --no-default-features --edges normal -p parpar | grep -E 'parpar-sys|parpar-ffi'
         working-directory: rust
       - name: generate + FORCE_FFI clean error
         run: |
@@ -113,6 +122,8 @@ jobs:
       - name: build pinned JS addon
         run: npm install
         continue-on-error: true
+      # the FFI oracle build (parpar-sys) needs libuv headers
+      - run: sudo apt-get update && sudo apt-get install -y libuv1-dev
       - name: cargo test --workspace
         env:
           PARPAR_FFI_BIN: ${{ github.workspace }}/rust/target/release/parpar
@@ -177,6 +188,8 @@ jobs:
           echo "94e97d623fec54385686e1e7ba65ebc9941748c05ee451423948334892bf2b50  /tmp/sde.tar.xz" | sha256sum -c -
           mkdir -p /tmp/sde
           tar -xJf /tmp/sde.tar.xz --strip-components=1 -C /tmp/sde
+      # the differential test's dev-dep oracle (parpar-sys) needs libuv
+      - run: sudo apt-get update && sudo apt-get install -y libuv1-dev
       - name: run test binaries under SDE
         run: |
           cargo test -p parpar-gf16 --no-run
@@ -204,7 +217,7 @@ jobs:
           # native ARM runner for the aarch64 glibc binary
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
           # macOS both arches, Windows x86_64
-          - { os: macos-13,         target: x86_64-apple-darwin }
+          - { os: macos-15-intel,   target: x86_64-apple-darwin }
           - { os: macos-latest,     target: aarch64-apple-darwin }
           - { os: windows-latest,   target: x86_64-pc-windows-msvc }
     name: binary (${{ matrix.target }})
