@@ -1,0 +1,137 @@
+name: Build Rust release binary
+on:
+  release:
+    types: [published]
+  # dry-run builds (no release upload) for testing this pipeline
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # Same target matrix as the test workflow's build-binaries job. Pure-Rust
+  # builds (--no-default-features): no C++ runtime dependency; musl targets
+  # are fully static via rust-lld (see rust/.cargo/config.toml).
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc + static musl for Linux/x86_64
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  slug: linux-glibc-amd64 }
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-musl, slug: linux-musl-amd64 }
+          # aarch64 + riscv64 cross-compile self-contained via rust-lld
+          - { os: ubuntu-latest,    target: aarch64-unknown-linux-musl, slug: linux-musl-arm64 }
+          - { os: ubuntu-latest,    target: riscv64gc-unknown-linux-musl, slug: linux-musl-riscv64 }
+          # native ARM runner for the aarch64 glibc binary
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, slug: linux-glibc-arm64 }
+          # macOS both arches, Windows x86_64
+          - { os: macos-15-intel,   target: x86_64-apple-darwin,  slug: macos-amd64 }
+          - { os: macos-14,         target: aarch64-apple-darwin, slug: macos-arm64 }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc, slug: win64 }
+    name: rust binary (${{ matrix.slug }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TAG: ${{ github.event.release.tag_name || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: build
+        run: cargo build --release --no-default-features --target ${{ matrix.target }} -p parpar
+        working-directory: rust
+      - name: smoke test
+        shell: bash
+        run: target/${{ matrix.target }}/release/parpar${{ runner.os == 'Windows' && '.exe' || '' }} --help | head -3
+        working-directory: rust
+      - name: package (unix)
+        if: runner.os != 'Windows'
+        env:
+          ASSET: parpar-${{ env.TAG }}-rust-${{ matrix.slug }}
+        run: |
+          cp target/${{ matrix.target }}/release/parpar parpar
+          tar -cJf "${ASSET}.tar.xz" parpar
+        working-directory: rust
+      - name: package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ASSET: parpar-${{ env.TAG }}-rust-${{ matrix.slug }}
+        run: |
+          Copy-Item target/${{ matrix.target }}/release/parpar.exe parpar.exe
+          7z a -t7z -mx=9 "${env:ASSET}.7z" parpar.exe
+        working-directory: rust
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-bin-${{ matrix.slug }}
+          path: rust/parpar-${{ env.TAG }}-rust-${{ matrix.slug }}.*
+          compression-level: 0 # already compressed
+      - name: Get release
+        if: github.event_name == 'release'
+        id: get_release
+        uses: bruceadams/get-release@v1.3.2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: upload (unix)
+        if: github.event_name == 'release' && runner.os != 'Windows'
+        uses: sekwah41/upload-release-assets@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          upload_url: ${{ steps.get_release.outputs.upload_url }}
+          asset_path: rust/parpar-${{ env.TAG }}-rust-${{ matrix.slug }}.tar.xz
+          asset_name: parpar-${{ env.TAG }}-rust-${{ matrix.slug }}.tar.xz
+          asset_content_type: application/octet-stream
+      - name: upload (windows)
+        if: github.event_name == 'release' && runner.os == 'Windows'
+        uses: sekwah41/upload-release-assets@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          upload_url: ${{ steps.get_release.outputs.upload_url }}
+          asset_path: rust/parpar-${{ env.TAG }}-rust-${{ matrix.slug }}.7z
+          asset_name: parpar-${{ env.TAG }}-rust-${{ matrix.slug }}.7z
+          asset_content_type: application/octet-stream
+
+  checksums:
+    name: SHA256SUMS.txt
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rust-bin-*
+          merge-multiple: true
+      - name: hash
+        run: |
+          ls -la
+          sha256sum parpar-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-bin-sha256sums
+          path: SHA256SUMS.txt
+          compression-level: 0
+      - name: Get release
+        if: github.event_name == 'release'
+        id: get_release
+        uses: bruceadams/get-release@v1.3.2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: upload
+        if: github.event_name == 'release'
+        uses: sekwah41/upload-release-assets@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          upload_url: ${{ steps.get_release.outputs.upload_url }}
+          asset_path: SHA256SUMS.txt
+          asset_name: parpar-${{ env.TAG }}-rust-SHA256SUMS.txt
+          asset_content_type: text/plain
