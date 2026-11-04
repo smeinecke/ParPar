@@ -34,7 +34,7 @@ jobs:
           workspaces: rust
       - name: install libuv (C++ oracle dependency)
         if: matrix.ffi == '1'
-        run: sudo apt-get update && sudo apt-get install -y libuv1-dev
+        run: sudo apt-get update && sudo apt-get install -y libuv1-dev par2cmdline
       - name: cargo test --workspace (with C++ oracle)
         if: matrix.ffi == '1'
         run: cargo test --workspace --all-targets
@@ -65,7 +65,7 @@ jobs:
         with:
           workspaces: rust
       # gnu dev-deps build the C++ oracle (parpar-sys) which needs libuv
-      - run: sudo apt-get update && sudo apt-get install -y libuv1-dev
+      - run: sudo apt-get update && sudo apt-get install -y libuv1-dev par2cmdline
       - run: cargo test -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl
         working-directory: rust
       - run: cargo build --release --no-default-features -p parpar
@@ -123,7 +123,7 @@ jobs:
         run: npm install
         continue-on-error: true
       # the FFI oracle build (parpar-sys) needs libuv headers
-      - run: sudo apt-get update && sudo apt-get install -y libuv1-dev
+      - run: sudo apt-get update && sudo apt-get install -y libuv1-dev par2cmdline
       - name: cargo test --workspace
         env:
           PARPAR_FFI_BIN: ${{ github.workspace }}/rust/target/release/parpar
@@ -189,7 +189,7 @@ jobs:
           mkdir -p /tmp/sde
           tar -xJf /tmp/sde.tar.xz --strip-components=1 -C /tmp/sde
       # the differential test's dev-dep oracle (parpar-sys) needs libuv
-      - run: sudo apt-get update && sudo apt-get install -y libuv1-dev
+      - run: sudo apt-get update && sudo apt-get install -y libuv1-dev par2cmdline
       - name: run test binaries under SDE
         run: |
           cargo test -p parpar-gf16 --no-run
