@@ -427,6 +427,9 @@ pub trait HasherInput: Send {
     /// buffer (with all per-slice records written). The hasher is finished.
     fn end(&mut self, out: &mut [u8]) -> Result<Box<[u8]>>;
     fn reset(&mut self) -> Result<()>;
+    /// Deposit a file MD5 computed outside the hasher (lane-split read
+    /// thread). Backends that hash the file lane internally ignore it.
+    fn set_file_md5(&mut self, _md5: &[u8; 16]) {}
 }
 
 /// Multi-region output hasher (MD5Multi): hashes N equal-length buffers.

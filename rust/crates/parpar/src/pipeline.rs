@@ -633,6 +633,11 @@ impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
         );
         reader.set_buffers(std::mem::take(&mut self.buf_pool));
         reader.set_max_queue_per_file(self.gen.opts.read_hash_queue as u32);
+        // lane-split hashing: when the native input hasher is active the
+        // reader computes each file's MD5 on the producer thread; the
+        // consumer-side hasher then only runs the block MD5 + CRC lane
+        let lane_split = self.gen.par2.gen.ctx.lane_split_inhash();
+        reader.set_compute_file_md5(lane_split);
 
         let mut slices_per_read = 0u64;
         if self.chunker.is_some() {
@@ -655,6 +660,11 @@ impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
                     let fidx = data.file_index;
                     if first {
                         let f = &mut self.gen.par2.files[fidx];
+                        // lane-split: deposit the producer-thread file MD5
+                        // before the final chunk's process_hash -> end()
+                        if let Some(d) = data.file_md5 {
+                            f.set_file_md5(&d);
+                        }
                         if let Err(e) = f.process_hash(&data.buffer) {
                             res = Err(e.to_string());
                             return;

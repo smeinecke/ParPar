@@ -1346,6 +1346,38 @@ impl Md5X2 {
     pub fn extract(&self, lane: usize) -> [u32; 4] {
         self.state[lane * 4..lane * 4 + 4].try_into().unwrap()
     }
+    /// Feed only lane 0 (block hash). Used when the file lane is computed
+    /// on a separate thread (the read side) and this context is lane0-only.
+    #[inline]
+    pub fn update_lane0(&mut self, data: &[u8]) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            if x86_use_bmi1() {
+                return md5_block_x1_asm_bmi1(self.state.as_mut_ptr(), data.as_ptr());
+            }
+            return md5_block_x1_asm(self.state.as_mut_ptr(), data.as_ptr());
+        }
+        #[allow(unreachable_code)]
+        {
+            let l0: &mut [u32; 4] = (&mut self.state[..4]).try_into().unwrap();
+            md5_process_block(l0, &data[..MD5_BLOCKSIZE]);
+        }
+    }
+}
+
+/// Single-lane block step shared by Md5Ctx::update - same dispatch as the
+/// x2 kernels (BMI1 variant when the CPU supports it).
+#[inline]
+fn md5_block_x1(state: &mut [u32; 4], data: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if x86_use_bmi1() {
+            return md5_block_x1_asm_bmi1(state.as_mut_ptr(), data.as_ptr());
+        }
+        return md5_block_x1_asm(state.as_mut_ptr(), data.as_ptr());
+    }
+    #[allow(unreachable_code)]
+    md5_process_block(state, &data[..MD5_BLOCKSIZE]);
 }
 
 /// Streaming single-lane MD5 (for HasherOutput / MD5Multi regions).
@@ -1375,7 +1407,7 @@ impl Md5Ctx {
             data = &data[take..];
             if self.tmp_len == MD5_BLOCKSIZE {
                 let tmp = self.tmp;
-                md5_process_block(&mut self.state, &tmp);
+                md5_block_x1(&mut self.state, &tmp);
                 self.tmp_len = 0;
             }
             if data.is_empty() {
@@ -1383,7 +1415,7 @@ impl Md5Ctx {
             }
         }
         while data.len() >= MD5_BLOCKSIZE {
-            md5_process_block(&mut self.state, &data[..MD5_BLOCKSIZE]);
+            md5_block_x1(&mut self.state, &data[..MD5_BLOCKSIZE]);
             data = &data[MD5_BLOCKSIZE..];
         }
         self.tmp[..data.len()].copy_from_slice(data);
@@ -1496,5 +1528,822 @@ mod sse_tests {
             }
             assert_eq!(st.state, want);
         }
+    }
+}
+
+// ===== single-lane variants (lane-split hashing) =====
+
+macro_rules! md5_rf4_x1 {
+    // 4 rounds, roles rotate (a,b,c,d)->(d,a,b,c)->(c,d,a,b)->(b,c,d,a)
+    //
+    ($a1:ident, $b1:ident, $c1:ident, $d1:ident, $p:ident,
+     $i0:expr, $i1:expr, $i2:expr, $i3:expr,
+     $k0:expr, $k1:expr, $k2:expr, $k3:expr,
+     $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {
+        std::arch::asm!(
+"             mov {t1:e}, {d1:e}
+             add {a1:e}, {K0}
+             xor {t1:e}, {c1:e}
+             and {t1:e}, {b1:e}
+             xor {t1:e}, {d1:e}
+             add {d1:e}, DWORD PTR [{p}+{OFF0}]
+             add {a1:e}, {t1:e}
+             rol {a1:e}, {R0}
+             add {a1:e}, {b1:e}
+             mov {t1:e}, {c1:e}
+             add {d1:e}, {K1}
+             xor {t1:e}, {b1:e}
+             and {t1:e}, {a1:e}
+             xor {t1:e}, {c1:e}
+             add {c1:e}, DWORD PTR [{p}+{OFF1}]
+             add {d1:e}, {t1:e}
+             rol {d1:e}, {R1}
+             add {d1:e}, {a1:e}
+             mov {t1:e}, {b1:e}
+             add {c1:e}, {K2}
+             xor {t1:e}, {a1:e}
+             and {t1:e}, {d1:e}
+             xor {t1:e}, {b1:e}
+             add {b1:e}, DWORD PTR [{p}+{OFF2}]
+             add {c1:e}, {t1:e}
+             rol {c1:e}, {R2}
+             add {c1:e}, {d1:e}
+             mov {t1:e}, {a1:e}
+             add {b1:e}, {K3}
+             xor {t1:e}, {d1:e}
+             and {t1:e}, {c1:e}
+             xor {t1:e}, {a1:e}
+             add {a1:e}, DWORD PTR [{p}+{OFF3}]
+             add {b1:e}, {t1:e}
+             rol {b1:e}, {R3}
+             add {b1:e}, {c1:e}
+",
+            a1 = inout(reg) $a1, b1 = inout(reg) $b1,
+            c1 = inout(reg) $c1, d1 = inout(reg) $d1,
+            t1 = out(reg) _, p = in(reg) $p,              OFF0 = const ($i0 * 4), OFF1 = const ($i1 * 4), OFF2 = const ($i2 * 4), OFF3 = const ($i3 * 4),
+             K0 = const $k0, K1 = const $k1, K2 = const $k2, K3 = const $k3,
+             R0 = const $r0, R1 = const $r1, R2 = const $r2, R3 = const $r3,
+            options(nostack, pure, readonly),
+        )
+    };
+}
+
+macro_rules! md5_rg4_x1 {
+    // 4 rounds, roles rotate (a,b,c,d)->(d,a,b,c)->(c,d,a,b)->(b,c,d,a)
+    //
+    ($a1:ident, $b1:ident, $c1:ident, $d1:ident, $p:ident,
+     $i0:expr, $i1:expr, $i2:expr, $i3:expr,
+     $k0:expr, $k1:expr, $k2:expr, $k3:expr,
+     $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {
+        std::arch::asm!(
+"             mov {t1:e}, {d1:e}
+             add {a1:e}, {K0}
+             not {t1:e}
+             and {t1:e}, {c1:e}
+             add {a1:e}, {t1:e}
+             mov {t1:e}, {d1:e}
+             add {d1:e}, DWORD PTR [{p}+{OFF0}]
+             and {t1:e}, {b1:e}
+             add {a1:e}, {t1:e}
+             rol {a1:e}, {R0}
+             add {a1:e}, {b1:e}
+             mov {t1:e}, {c1:e}
+             add {d1:e}, {K1}
+             not {t1:e}
+             and {t1:e}, {b1:e}
+             add {d1:e}, {t1:e}
+             mov {t1:e}, {c1:e}
+             add {c1:e}, DWORD PTR [{p}+{OFF1}]
+             and {t1:e}, {a1:e}
+             add {d1:e}, {t1:e}
+             rol {d1:e}, {R1}
+             add {d1:e}, {a1:e}
+             mov {t1:e}, {b1:e}
+             add {c1:e}, {K2}
+             not {t1:e}
+             and {t1:e}, {a1:e}
+             add {c1:e}, {t1:e}
+             mov {t1:e}, {b1:e}
+             add {b1:e}, DWORD PTR [{p}+{OFF2}]
+             and {t1:e}, {d1:e}
+             add {c1:e}, {t1:e}
+             rol {c1:e}, {R2}
+             add {c1:e}, {d1:e}
+             mov {t1:e}, {a1:e}
+             add {b1:e}, {K3}
+             not {t1:e}
+             and {t1:e}, {d1:e}
+             add {b1:e}, {t1:e}
+             mov {t1:e}, {a1:e}
+             add {a1:e}, DWORD PTR [{p}+{OFF3}]
+             and {t1:e}, {c1:e}
+             add {b1:e}, {t1:e}
+             rol {b1:e}, {R3}
+             add {b1:e}, {c1:e}
+",
+            a1 = inout(reg) $a1, b1 = inout(reg) $b1,
+            c1 = inout(reg) $c1, d1 = inout(reg) $d1,
+            t1 = out(reg) _, p = in(reg) $p,              OFF0 = const ($i0 * 4), OFF1 = const ($i1 * 4), OFF2 = const ($i2 * 4), OFF3 = const ($i3 * 4),
+             K0 = const $k0, K1 = const $k1, K2 = const $k2, K3 = const $k3,
+             R0 = const $r0, R1 = const $r1, R2 = const $r2, R3 = const $r3,
+            options(nostack, pure, readonly),
+        )
+    };
+}
+
+macro_rules! md5_rh4_x1 {
+    // 4 rounds, roles rotate (a,b,c,d)->(d,a,b,c)->(c,d,a,b)->(b,c,d,a)
+    //
+    ($a1:ident, $b1:ident, $c1:ident, $d1:ident, $p:ident,
+     $i0:expr, $i1:expr, $i2:expr, $i3:expr,
+     $k0:expr, $k1:expr, $k2:expr, $k3:expr,
+     $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {
+        std::arch::asm!(
+"             mov {t1:e}, {d1:e}
+             add {a1:e}, {K0}
+             xor {t1:e}, {c1:e}
+             add {d1:e}, DWORD PTR [{p}+{OFF0}]
+             xor {t1:e}, {b1:e}
+             add {a1:e}, {t1:e}
+             rol {a1:e}, {R0}
+             add {a1:e}, {b1:e}
+             mov {t1:e}, {c1:e}
+             add {d1:e}, {K1}
+             xor {t1:e}, {b1:e}
+             add {c1:e}, DWORD PTR [{p}+{OFF1}]
+             xor {t1:e}, {a1:e}
+             add {d1:e}, {t1:e}
+             rol {d1:e}, {R1}
+             add {d1:e}, {a1:e}
+             mov {t1:e}, {b1:e}
+             add {c1:e}, {K2}
+             xor {t1:e}, {a1:e}
+             add {b1:e}, DWORD PTR [{p}+{OFF2}]
+             xor {t1:e}, {d1:e}
+             add {c1:e}, {t1:e}
+             rol {c1:e}, {R2}
+             add {c1:e}, {d1:e}
+             mov {t1:e}, {a1:e}
+             add {b1:e}, {K3}
+             xor {t1:e}, {d1:e}
+             add {a1:e}, DWORD PTR [{p}+{OFF3}]
+             xor {t1:e}, {c1:e}
+             add {b1:e}, {t1:e}
+             rol {b1:e}, {R3}
+             add {b1:e}, {c1:e}
+",
+            a1 = inout(reg) $a1, b1 = inout(reg) $b1,
+            c1 = inout(reg) $c1, d1 = inout(reg) $d1,
+            t1 = out(reg) _, p = in(reg) $p,              OFF0 = const ($i0 * 4), OFF1 = const ($i1 * 4), OFF2 = const ($i2 * 4), OFF3 = const ($i3 * 4),
+             K0 = const $k0, K1 = const $k1, K2 = const $k2, K3 = const $k3,
+             R0 = const $r0, R1 = const $r1, R2 = const $r2, R3 = const $r3,
+            options(nostack, pure, readonly),
+        )
+    };
+}
+
+macro_rules! md5_ri4_x1 {
+    // 4 rounds, roles rotate (a,b,c,d)->(d,a,b,c)->(c,d,a,b)->(b,c,d,a)
+    //
+    ($a1:ident, $b1:ident, $c1:ident, $d1:ident, $p:ident,
+     $i0:expr, $i1:expr, $i2:expr, $i3:expr,
+     $k0:expr, $k1:expr, $k2:expr, $k3:expr,
+     $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {
+        std::arch::asm!(
+"             mov {t1:e}, {d1:e}
+             add {a1:e}, {K0}
+             not {t1:e}
+             or {t1:e}, {b1:e}
+             xor {t1:e}, {c1:e}
+             add {d1:e}, DWORD PTR [{p}+{OFF0}]
+             add {a1:e}, {t1:e}
+             rol {a1:e}, {R0}
+             add {a1:e}, {b1:e}
+             mov {t1:e}, {c1:e}
+             add {d1:e}, {K1}
+             not {t1:e}
+             or {t1:e}, {a1:e}
+             xor {t1:e}, {b1:e}
+             add {c1:e}, DWORD PTR [{p}+{OFF1}]
+             add {d1:e}, {t1:e}
+             rol {d1:e}, {R1}
+             add {d1:e}, {a1:e}
+             mov {t1:e}, {b1:e}
+             add {c1:e}, {K2}
+             not {t1:e}
+             or {t1:e}, {d1:e}
+             xor {t1:e}, {a1:e}
+             add {b1:e}, DWORD PTR [{p}+{OFF2}]
+             add {c1:e}, {t1:e}
+             rol {c1:e}, {R2}
+             add {c1:e}, {d1:e}
+             mov {t1:e}, {a1:e}
+             add {b1:e}, {K3}
+             not {t1:e}
+             or {t1:e}, {c1:e}
+             xor {t1:e}, {d1:e}
+             add {a1:e}, DWORD PTR [{p}+{OFF3}]
+             add {b1:e}, {t1:e}
+             rol {b1:e}, {R3}
+             add {b1:e}, {c1:e}
+",
+            a1 = inout(reg) $a1, b1 = inout(reg) $b1,
+            c1 = inout(reg) $c1, d1 = inout(reg) $d1,
+            t1 = out(reg) _, p = in(reg) $p,              OFF0 = const ($i0 * 4), OFF1 = const ($i1 * 4), OFF2 = const ($i2 * 4), OFF3 = const ($i3 * 4),
+             K0 = const $k0, K1 = const $k1, K2 = const $k2, K3 = const $k3,
+             R0 = const $r0, R1 = const $r1, R2 = const $r2, R3 = const $r3,
+            options(nostack, pure, readonly),
+        )
+    };
+}
+
+macro_rules! md5_ri4_last_x1 {
+    // 4 rounds, roles rotate (a,b,c,d)->(d,a,b,c)->(c,d,a,b)->(b,c,d,a)
+    // last round has no message-word prefetch
+    ($a1:ident, $b1:ident, $c1:ident, $d1:ident, $p:ident,
+     $i0:expr, $i1:expr, $i2:expr,
+     $k0:expr, $k1:expr, $k2:expr, $k3:expr,
+     $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {
+        std::arch::asm!(
+"             mov {t1:e}, {d1:e}
+             add {a1:e}, {K0}
+             not {t1:e}
+             or {t1:e}, {b1:e}
+             xor {t1:e}, {c1:e}
+             add {d1:e}, DWORD PTR [{p}+{OFF0}]
+             add {a1:e}, {t1:e}
+             rol {a1:e}, {R0}
+             add {a1:e}, {b1:e}
+             mov {t1:e}, {c1:e}
+             add {d1:e}, {K1}
+             not {t1:e}
+             or {t1:e}, {a1:e}
+             xor {t1:e}, {b1:e}
+             add {c1:e}, DWORD PTR [{p}+{OFF1}]
+             add {d1:e}, {t1:e}
+             rol {d1:e}, {R1}
+             add {d1:e}, {a1:e}
+             mov {t1:e}, {b1:e}
+             add {c1:e}, {K2}
+             not {t1:e}
+             or {t1:e}, {d1:e}
+             xor {t1:e}, {a1:e}
+             add {b1:e}, DWORD PTR [{p}+{OFF2}]
+             add {c1:e}, {t1:e}
+             rol {c1:e}, {R2}
+             add {c1:e}, {d1:e}
+             mov {t1:e}, {a1:e}
+             add {b1:e}, {K3}
+             not {t1:e}
+             or {t1:e}, {c1:e}
+             xor {t1:e}, {d1:e}
+             add {b1:e}, {t1:e}
+             rol {b1:e}, {R3}
+             add {b1:e}, {c1:e}
+",
+            a1 = inout(reg) $a1, b1 = inout(reg) $b1,
+            c1 = inout(reg) $c1, d1 = inout(reg) $d1,
+            t1 = out(reg) _, p = in(reg) $p,              OFF0 = const ($i0 * 4), OFF1 = const ($i1 * 4), OFF2 = const ($i2 * 4),
+             K0 = const $k0, K1 = const $k1, K2 = const $k2, K3 = const $k3,
+             R0 = const $r0, R1 = const $r1, R2 = const $r2, R3 = const $r3,
+            options(nostack, pure, readonly),
+        )
+    };
+}
+
+macro_rules! md5_rg4_bmi1_x1 {
+    // BMI1 variant: andn replaces mov+not+and in the first G term
+    ($a1:ident, $b1:ident, $c1:ident, $d1:ident, $p:ident,
+     $i0:expr, $i1:expr, $i2:expr, $i3:expr,
+     $k0:expr, $k1:expr, $k2:expr, $k3:expr,
+     $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {
+        std::arch::asm!(
+"             add {a1:e}, {K0}
+             andn {t1:e}, {d1:e}, {c1:e}
+             add {a1:e}, {t1:e}
+             mov {t1:e}, {d1:e}
+             add {d1:e}, DWORD PTR [{p}+{OFF0}]
+             and {t1:e}, {b1:e}
+             add {a1:e}, {t1:e}
+             rol {a1:e}, {R0}
+             add {a1:e}, {b1:e}
+             add {d1:e}, {K1}
+             andn {t1:e}, {c1:e}, {b1:e}
+             add {d1:e}, {t1:e}
+             mov {t1:e}, {c1:e}
+             add {c1:e}, DWORD PTR [{p}+{OFF1}]
+             and {t1:e}, {a1:e}
+             add {d1:e}, {t1:e}
+             rol {d1:e}, {R1}
+             add {d1:e}, {a1:e}
+             add {c1:e}, {K2}
+             andn {t1:e}, {b1:e}, {a1:e}
+             add {c1:e}, {t1:e}
+             mov {t1:e}, {b1:e}
+             add {b1:e}, DWORD PTR [{p}+{OFF2}]
+             and {t1:e}, {d1:e}
+             add {c1:e}, {t1:e}
+             rol {c1:e}, {R2}
+             add {c1:e}, {d1:e}
+             add {b1:e}, {K3}
+             andn {t1:e}, {a1:e}, {d1:e}
+             add {b1:e}, {t1:e}
+             mov {t1:e}, {a1:e}
+             add {a1:e}, DWORD PTR [{p}+{OFF3}]
+             and {t1:e}, {c1:e}
+             add {b1:e}, {t1:e}
+             rol {b1:e}, {R3}
+             add {b1:e}, {c1:e}
+",
+            a1 = inout(reg) $a1, b1 = inout(reg) $b1,
+            c1 = inout(reg) $c1, d1 = inout(reg) $d1,
+            t1 = out(reg) _, p = in(reg) $p,              OFF0 = const ($i0 * 4), OFF1 = const ($i1 * 4), OFF2 = const ($i2 * 4), OFF3 = const ($i3 * 4),
+             K0 = const $k0, K1 = const $k1, K2 = const $k2, K3 = const $k3,
+             R0 = const $r0, R1 = const $r1, R2 = const $r2, R3 = const $r3,
+            options(nostack, pure, readonly),
+        )
+    };
+}
+
+macro_rules! md5_ri4_bmi1_x1 {
+    // BMI1 variant: I(x,y,z)=y^(x|~z) evaluated as -( z^(~x&y) )-1 via andn+sub
+    ($a1:ident, $b1:ident, $c1:ident, $d1:ident, $p:ident,
+     $i0:expr, $i1:expr, $i2:expr, $i3:expr,
+     $k0:expr, $k1:expr, $k2:expr, $k3:expr,
+     $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {
+        std::arch::asm!(
+"             add {a1:e}, {K0}
+             andn {t1:e}, {b1:e}, {d1:e}
+             xor {t1:e}, {c1:e}
+             add {d1:e}, DWORD PTR [{p}+{OFF0}]
+             sub {a1:e}, {t1:e}
+             rol {a1:e}, {R0}
+             add {a1:e}, {b1:e}
+             add {d1:e}, {K1}
+             andn {t1:e}, {a1:e}, {c1:e}
+             xor {t1:e}, {b1:e}
+             add {c1:e}, DWORD PTR [{p}+{OFF1}]
+             sub {d1:e}, {t1:e}
+             rol {d1:e}, {R1}
+             add {d1:e}, {a1:e}
+             add {c1:e}, {K2}
+             andn {t1:e}, {d1:e}, {b1:e}
+             xor {t1:e}, {a1:e}
+             add {b1:e}, DWORD PTR [{p}+{OFF2}]
+             sub {c1:e}, {t1:e}
+             rol {c1:e}, {R2}
+             add {c1:e}, {d1:e}
+             add {b1:e}, {K3}
+             andn {t1:e}, {c1:e}, {a1:e}
+             xor {t1:e}, {d1:e}
+             add {a1:e}, DWORD PTR [{p}+{OFF3}]
+             sub {b1:e}, {t1:e}
+             rol {b1:e}, {R3}
+             add {b1:e}, {c1:e}
+",
+            a1 = inout(reg) $a1, b1 = inout(reg) $b1,
+            c1 = inout(reg) $c1, d1 = inout(reg) $d1,
+            t1 = out(reg) _, p = in(reg) $p,              OFF0 = const ($i0 * 4), OFF1 = const ($i1 * 4), OFF2 = const ($i2 * 4), OFF3 = const ($i3 * 4),
+             K0 = const ($k0 - 1), K1 = const ($k1 - 1), K2 = const ($k2 - 1), K3 = const ($k3 - 1),
+             R0 = const $r0, R1 = const $r1, R2 = const $r2, R3 = const $r3,
+            options(nostack, pure, readonly),
+        )
+    };
+}
+
+macro_rules! md5_ri4_last_bmi1_x1 {
+    // BMI1 variant of md5_ri4_last - final round has no message prefetch
+    ($a1:ident, $b1:ident, $c1:ident, $d1:ident, $p:ident,
+     $i0:expr, $i1:expr, $i2:expr,
+     $k0:expr, $k1:expr, $k2:expr, $k3:expr,
+     $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {
+        std::arch::asm!(
+"             add {a1:e}, {K0}
+             andn {t1:e}, {b1:e}, {d1:e}
+             xor {t1:e}, {c1:e}
+             add {d1:e}, DWORD PTR [{p}+{OFF0}]
+             sub {a1:e}, {t1:e}
+             rol {a1:e}, {R0}
+             add {a1:e}, {b1:e}
+             add {d1:e}, {K1}
+             andn {t1:e}, {a1:e}, {c1:e}
+             xor {t1:e}, {b1:e}
+             add {c1:e}, DWORD PTR [{p}+{OFF1}]
+             sub {d1:e}, {t1:e}
+             rol {d1:e}, {R1}
+             add {d1:e}, {a1:e}
+             add {c1:e}, {K2}
+             andn {t1:e}, {d1:e}, {b1:e}
+             xor {t1:e}, {a1:e}
+             add {b1:e}, DWORD PTR [{p}+{OFF2}]
+             sub {c1:e}, {t1:e}
+             rol {c1:e}, {R2}
+             add {c1:e}, {d1:e}
+             add {b1:e}, {K3}
+             andn {t1:e}, {c1:e}, {a1:e}
+             xor {t1:e}, {d1:e}
+             sub {b1:e}, {t1:e}
+             rol {b1:e}, {R3}
+             add {b1:e}, {c1:e}
+",
+            a1 = inout(reg) $a1, b1 = inout(reg) $b1,
+            c1 = inout(reg) $c1, d1 = inout(reg) $d1,
+            t1 = out(reg) _, p = in(reg) $p,              OFF0 = const ($i0 * 4), OFF1 = const ($i1 * 4), OFF2 = const ($i2 * 4),
+             K0 = const ($k0 - 1), K1 = const ($k1 - 1), K2 = const ($k2 - 1), K3 = const ($k3 - 1),
+             R0 = const $r0, R1 = const $r1, R2 = const $r2, R3 = const $r3,
+            options(nostack, pure, readonly),
+        )
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+macro_rules! md5_block_x1_impl {
+    ($fname:ident, $rg4:ident, $ri4:ident, $ri4l:ident) => {
+        unsafe fn $fname(state: *mut u32, src0: *const u8) {
+            let p = src0;
+            let mut a1 = state.add(0).read();
+            let mut b1 = state.add(1).read();
+            let mut c1 = state.add(2).read();
+            let mut d1 = state.add(3).read();
+            // first message words folded in ahead of round 0 (like `A1 += read32()`)
+            a1 = a1.wrapping_add((p as *const u32).read_unaligned());
+
+            // RF4/RG4/RH4/RI4 groups - rotation is baked into each template
+            md5_rf4_x1!(
+                a1,
+                b1,
+                c1,
+                d1,
+                p,
+                1,
+                2,
+                3,
+                4,
+                0xd76aa478u32,
+                0xe8c7b756u32,
+                0x242070dbu32,
+                0xc1bdceeeu32,
+                7,
+                12,
+                17,
+                22
+            );
+            md5_rf4_x1!(
+                a1,
+                b1,
+                c1,
+                d1,
+                p,
+                5,
+                6,
+                7,
+                8,
+                0xf57c0fafu32,
+                0x4787c62au32,
+                0xa8304613u32,
+                0xfd469501u32,
+                7,
+                12,
+                17,
+                22
+            );
+            md5_rf4_x1!(
+                a1,
+                b1,
+                c1,
+                d1,
+                p,
+                9,
+                10,
+                11,
+                12,
+                0x698098d8u32,
+                0x8b44f7afu32,
+                0xffff5bb1u32,
+                0x895cd7beu32,
+                7,
+                12,
+                17,
+                22
+            );
+            md5_rf4_x1!(
+                a1,
+                b1,
+                c1,
+                d1,
+                p,
+                13,
+                14,
+                15,
+                1,
+                0x6b901122u32,
+                0xfd987193u32,
+                0xa679438eu32,
+                0x49b40821u32,
+                7,
+                12,
+                17,
+                22
+            );
+            $rg4!(
+                a1,
+                b1,
+                c1,
+                d1,
+                p,
+                6,
+                11,
+                0,
+                5,
+                0xf61e2562u32,
+                0xc040b340u32,
+                0x265e5a51u32,
+                0xe9b6c7aau32,
+                5,
+                9,
+                14,
+                20
+            );
+            $rg4!(
+                a1,
+                b1,
+                c1,
+                d1,
+                p,
+                10,
+                15,
+                4,
+                9,
+                0xd62f105du32,
+                0x02441453u32,
+                0xd8a1e681u32,
+                0xe7d3fbc8u32,
+                5,
+                9,
+                14,
+                20
+            );
+            $rg4!(
+                a1,
+                b1,
+                c1,
+                d1,
+                p,
+                14,
+                3,
+                8,
+                13,
+                0x21e1cde6u32,
+                0xc33707d6u32,
+                0xf4d50d87u32,
+                0x455a14edu32,
+                5,
+                9,
+                14,
+                20
+            );
+            $rg4!(
+                a1,
+                b1,
+                c1,
+                d1,
+                p,
+                2,
+                7,
+                12,
+                5,
+                0xa9e3e905u32,
+                0xfcefa3f8u32,
+                0x676f02d9u32,
+                0x8d2a4c8au32,
+                5,
+                9,
+                14,
+                20
+            );
+            md5_rh4_x1!(
+                a1,
+                b1,
+                c1,
+                d1,
+                p,
+                8,
+                11,
+                14,
+                1,
+                0xfffa3942u32,
+                0x8771f681u32,
+                0x6d9d6122u32,
+                0xfde5380cu32,
+                4,
+                11,
+                16,
+                23
+            );
+            md5_rh4_x1!(
+                a1,
+                b1,
+                c1,
+                d1,
+                p,
+                4,
+                7,
+                10,
+                13,
+                0xa4beea44u32,
+                0x4bdecfa9u32,
+                0xf6bb4b60u32,
+                0xbebfbc70u32,
+                4,
+                11,
+                16,
+                23
+            );
+            md5_rh4_x1!(
+                a1,
+                b1,
+                c1,
+                d1,
+                p,
+                0,
+                3,
+                6,
+                9,
+                0x289b7ec6u32,
+                0xeaa127fau32,
+                0xd4ef3085u32,
+                0x04881d05u32,
+                4,
+                11,
+                16,
+                23
+            );
+            md5_rh4_x1!(
+                a1,
+                b1,
+                c1,
+                d1,
+                p,
+                12,
+                15,
+                2,
+                0,
+                0xd9d4d039u32,
+                0xe6db99e5u32,
+                0x1fa27cf8u32,
+                0xc4ac5665u32,
+                4,
+                11,
+                16,
+                23
+            );
+            $ri4!(
+                a1,
+                b1,
+                c1,
+                d1,
+                p,
+                7,
+                14,
+                5,
+                12,
+                0xf4292244u32,
+                0x432aff97u32,
+                0xab9423a7u32,
+                0xfc93a039u32,
+                6,
+                10,
+                15,
+                21
+            );
+            $ri4!(
+                a1,
+                b1,
+                c1,
+                d1,
+                p,
+                3,
+                10,
+                1,
+                8,
+                0x655b59c3u32,
+                0x8f0ccc92u32,
+                0xffeff47du32,
+                0x85845dd1u32,
+                6,
+                10,
+                15,
+                21
+            );
+            $ri4!(
+                a1,
+                b1,
+                c1,
+                d1,
+                p,
+                15,
+                6,
+                13,
+                4,
+                0x6fa87e4fu32,
+                0xfe2ce6e0u32,
+                0xa3014314u32,
+                0x4e0811a1u32,
+                6,
+                10,
+                15,
+                21
+            );
+            $ri4l!(
+                a1,
+                b1,
+                c1,
+                d1,
+                p,
+                11,
+                2,
+                9,
+                0xf7537e82u32,
+                0xbd3af235u32,
+                0x2ad7d2bbu32,
+                0xeb86d391u32,
+                6,
+                10,
+                15,
+                21
+            );
+
+            state.add(0).write(state.add(0).read().wrapping_add(a1));
+            state.add(1).write(state.add(1).read().wrapping_add(b1));
+            state.add(2).write(state.add(2).read().wrapping_add(c1));
+            state.add(3).write(state.add(3).read().wrapping_add(d1));
+        }
+    };
+}
+
+md5_block_x1_impl!(md5_block_x1_asm, md5_rg4_x1, md5_ri4_x1, md5_ri4_last_x1);
+md5_block_x1_impl!(
+    md5_block_x1_asm_bmi1,
+    md5_rg4_bmi1_x1,
+    md5_ri4_bmi1_x1,
+    md5_ri4_last_bmi1_x1
+);
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod x1_tests {
+    use super::*;
+    #[test]
+    fn x1_matches_scalar() {
+        let mut data = vec![0u8; 64 * 37];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i as u32).wrapping_mul(2654435761) as u8;
+        }
+        let mut s_asm = [0x67452301u32, 0xefcdab89, 0x98badcfe, 0x10325476];
+        let mut s_ref = s_asm;
+        unsafe {
+            for blk in data.chunks_exact(64) {
+                md5_block_x1_asm(s_asm.as_mut_ptr(), blk.as_ptr());
+            }
+        }
+        for blk in data.chunks_exact(64) {
+            md5_process_block(&mut s_ref, blk);
+        }
+        assert_eq!(s_asm, s_ref);
+    }
+    #[test]
+    #[ignore]
+    fn x1_bench() {
+        let gib = 1usize << 30;
+        let data = vec![0xabu8; gib];
+        let mut st = [0x67452301u32, 0xefcdab89, 0x98badcfe, 0x10325476];
+        let t = std::time::Instant::now();
+        unsafe {
+            for blk in data.chunks_exact(64) {
+                md5_block_x1_asm(st.as_mut_ptr(), blk.as_ptr());
+            }
+        }
+        let el = t.elapsed().as_secs_f64();
+        eprintln!("x1: {:.2}s {:.2} GB/s", el, gib as f64 / el / 1e9);
+    }
+    #[test]
+    fn x1_bmi1_matches_scalar() {
+        if !super::x86_use_bmi1() {
+            return;
+        }
+        let mut data = vec![0u8; 64 * 41];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i as u32).wrapping_mul(40503) as u8;
+        }
+        let mut s_asm = [0x67452301u32, 0xefcdab89, 0x98badcfe, 0x10325476];
+        unsafe {
+            for blk in data.chunks_exact(64) {
+                md5_block_x1_asm_bmi1(s_asm.as_mut_ptr(), blk.as_ptr());
+            }
+        }
+        let mut s_ref = [0x67452301u32, 0xefcdab89, 0x98badcfe, 0x10325476];
+        for blk in data.chunks_exact(64) {
+            md5_process_block(&mut s_ref, blk);
+        }
+        assert_eq!(s_asm, s_ref);
     }
 }

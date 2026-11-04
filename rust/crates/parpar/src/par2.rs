@@ -675,6 +675,12 @@ pub trait GfCtx {
         slice_size: u64,
         block_out: Box<[u8]>,
     ) -> Result<Box<dyn HasherInput>>;
+    /// Whether new input hashers run lane-split (block MD5+CRC only) and
+    /// expect the read thread to deposit the whole-file MD5. Used to gate
+    /// the reader's producer-side file-MD5 lane.
+    fn lane_split_inhash(&self) -> bool {
+        false
+    }
 }
 
 /// A compute backend shared between multiple gens. Events are routed to
@@ -852,7 +858,10 @@ where
         block_out: Box<[u8]>,
     ) -> Result<Box<dyn HasherInput>> {
         if self.inner.borrow().native_hashers {
-            return Ok(Box::new(parpar_hasher::NativeHasherInput::new(
+            // lane-split: the sequential read thread computes the file MD5
+            // and deposits it via set_file_md5; the hasher only runs the
+            // per-slice block MD5 + CRC lane
+            return Ok(Box::new(parpar_hasher::NativeHasherInput::new_ext(
                 slice_size, block_out,
             )));
         }
@@ -862,6 +871,10 @@ where
                 .backend
                 .new_input_hasher(slice_size, block_out)?,
         ))
+    }
+
+    fn lane_split_inhash(&self) -> bool {
+        self.inner.borrow().native_hashers
     }
 }
 
@@ -1497,6 +1510,14 @@ impl Par2File {
         let block = self.take_checksum_records().unwrap_or_default();
         self.hasher = Some(ctx.new_input_hasher(slice_size, block)?);
         Ok(())
+    }
+
+    /// Deposit a whole-file MD5 produced by the read thread (lane-split
+    /// mode) - forwards to the live input hasher before end() consumes it.
+    pub fn set_file_md5(&mut self, md5: &[u8; 16]) {
+        if let Some(h) = self.hasher.as_mut() {
+            h.set_file_md5(md5);
+        }
     }
 
     /// `processHash(data, cb)` - feed the file hasher; at end-of-file the

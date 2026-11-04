@@ -212,6 +212,9 @@ pub struct FileReaderData {
     /// the hash-queue slot is released exactly once even if hashed() ends
     /// up running twice (explicit call + Drop)
     hash_pending: bool,
+    /// whole-file MD5 computed on the producer thread (lane-split mode);
+    /// set on the file's final chunk and deposited on the HasherInput
+    pub file_md5: Option<[u8; 16]>,
 }
 
 impl FileReaderData {
@@ -320,6 +323,10 @@ pub struct FileSeqReader {
     inner: Arc<SeqInner>,
     req_slice_len: u64,
     req_chunk_len: u64,
+    /// producer thread also streams each file's bytes through a whole-file
+    /// MD5 context; the digest rides out on the file's last chunk
+    /// (lane-split hashing - the HasherInput then only runs block MD5+CRC)
+    compute_file_md5: bool,
 }
 
 impl FileSeqReader {
@@ -345,7 +352,14 @@ impl FileSeqReader {
             }),
             req_slice_len: 0,
             req_chunk_len: 0,
+            compute_file_md5: false,
         }
+    }
+
+    /// Enable lane-split hashing: the producer thread computes each file's
+    /// whole-file MD5 and attaches it to the file's final chunk.
+    pub fn set_compute_file_md5(&mut self, on: bool) {
+        self.compute_file_md5 = on;
     }
 
     /// JS `reader.maxQueuePerFile = opts.readHashQueue`.
@@ -472,6 +486,10 @@ impl FileSeqReader {
                 &no_throttle
             }
         };
+        // lane-split file MD5: one streaming context per open file, keyed by
+        // its stable slot id (open_files reorder/remove makes indices unsafe)
+        let mut lane1: std::collections::HashMap<u64, parpar_hasher::FileMd5Ctx> =
+            std::collections::HashMap::new();
         loop {
             let mut st = self.inner.state.lock().unwrap();
             let buffer = match self.get_buf(&mut st) {
@@ -526,6 +544,9 @@ impl FileSeqReader {
                                     hash_queue: 0,
                                     slot,
                                 });
+                                if self.compute_file_md5 {
+                                    lane1.insert(slot, parpar_hasher::FileMd5Ctx::new());
+                                }
                                 st.lent_bufs = st.lent_bufs.saturating_sub(1);
                                 st.buf.push(buffer);
                             }
@@ -556,10 +577,10 @@ impl FileSeqReader {
             };
 
             // _doRead
-            let (rs, chunks, pos, info) = {
+            let (rs, chunks, pos, info, slot) = {
                 let ofile = &st.open_files[file_idx];
                 let (rs, chunks) = self.read_size(ofile.pos, self.files[ofile.info].size);
-                (rs, chunks, ofile.pos, ofile.info)
+                (rs, chunks, ofile.pos, ofile.info, ofile.slot)
             };
             let fd = match st.open_files[file_idx].fd.try_clone() {
                 Ok(fd) => fd,
@@ -604,6 +625,12 @@ impl FileSeqReader {
                 }
             };
 
+            // lane1: the file-MD5 stream hashes the raw bytes as read, on
+            // this producer thread, while the consumer runs block MD5+CRC
+            if let Some(ctx) = lane1.get_mut(&slot) {
+                ctx.update(&buffer[..n]);
+            }
+
             let new_pos = pos + n as u64;
             let fsize = self.files[info].size;
             if new_pos > fsize {
@@ -636,6 +663,11 @@ impl FileSeqReader {
                 reader: self.inner.clone(),
                 refs: 2,
                 hash_pending: true,
+                file_md5: if eof {
+                    lane1.remove(&slot).map(|mut c| c.finish())
+                } else {
+                    None
+                },
             };
             // JS hands out a view of the buffer and returns it via
             // hashed+release; deliver the buffer itself
