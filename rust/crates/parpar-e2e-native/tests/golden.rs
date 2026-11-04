@@ -167,7 +167,7 @@ fn golden_edge_and_multipass() {
 
     // single pass
     let mut files = file_info_for(&in_dir, &edge_names());
-    let (_g, outs) = generate(&mut files, &dir.join("gold"), SLICE, None, 4.0);
+    let (g, outs) = generate(&mut files, &dir.join("gold"), SLICE, None, 4.0);
     let got = manifest_for(&outs);
     if update {
         std::fs::write(mdir.join("golden.sha256"), &got).unwrap();
@@ -179,8 +179,13 @@ fn golden_edge_and_multipass() {
             .map(|(n, h)| (n.to_string(), h.to_string()))
             .collect();
         assert_eq!(
-            want, got_map,
-            "golden mismatch - run UPDATE_GOLDEN=1 to regenerate"
+            want,
+            got_map,
+            "golden mismatch - run UPDATE_GOLDEN=1 to regenerate\n  displayNames: {}\n  sizes: {:?}",
+            g.dump()["displayNames"],
+            outs.iter()
+                .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::metadata(p).unwrap().len()))
+                .collect::<Vec<_>>()
         );
     }
 
