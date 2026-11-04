@@ -1,0 +1,11 @@
+[package]
+name = "parpar-e2e-native"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+description = "Cross-platform native-pipeline e2e tests (no FFI, no C++ toolchain)"
+
+[dependencies]
+parpar = { path = "../parpar", default-features = false }
+parpar-gf16 = { path = "../parpar-gf16" }
+sha2 = "0.10.9"

@@ -45,26 +45,54 @@ fn generate(
     gf_method: MethodRef,
     rec_slices: f64,
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    generate_opts(
+        files,
+        out_base,
+        4096.0,
+        None,
+        rec_slices,
+        gf_method,
+        true,
+        true,
+        |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_opts(
+    files: &mut Vec<FileInfo>,
+    out_base: &Path,
+    slice: f64,
+    memory_limit: Option<f64>,
+    rec_slices: f64,
+    gf_method: MethodRef,
+    native_hash: bool,
+    native_gf: bool,
+    extra: impl FnOnce(&mut GenOpts),
+) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut o = GenOpts::default();
     o.gf_method = Some(gf_method);
     o.output_base = out_base.to_string_lossy().into_owned();
     o.output_overwrite = true;
+    o.creator = "ParPar v0.4.6 x64 [https://github.com/animetosho/parpar]".into();
+    o.memory_limit = memory_limit;
     o.recovery_slices = vec![SpecTerm {
         unit: SpecUnit::Slices,
         value: rec_slices,
         scale: 1.0,
     }];
+    extra(&mut o);
 
     let env = sys_env();
     let backend = FfiBackend::new().unwrap();
     let mut shared = SharedBackend::new(backend);
-    shared.set_native_hashers(true);
-    shared.set_native_proc(true);
+    shared.set_native_hashers(native_hash);
+    shared.set_native_proc(native_gf);
     let mut gen = Par2Gen::new(
         files,
         &SpecTerm {
             unit: SpecUnit::Bytes,
-            value: 4096.0,
+            value: slice,
             scale: 1.0,
         },
         o,
@@ -175,6 +203,19 @@ fn determinism() {
     assert_eq!(runs[0], runs[1], "identical runs produced different bytes");
 }
 
+/// Path to the JS CLI entry point: `$PARPAR_JS` override, else repo-
+/// relative (crates/parpar -> repo root bin/parpar.js).
+fn js_cli() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("PARPAR_JS") {
+        let p = std::path::PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bin/parpar.js");
+    p.exists().then_some(p)
+}
+
 /// `par2` binary in PATH (par2cmdline) - the independent verifier.
 fn par2_bin() -> Option<PathBuf> {
     std::env::var_os("PATH")?
@@ -251,4 +292,259 @@ fn par2cmdline_repair() {
         orig2,
         "f2.bin damaged"
     );
+}
+
+/// Forced multi-pass recovery (256 slices over a 512 KiB limit, the
+/// mem_limit_min oracle shape): FFI pipeline and native pipeline must
+/// produce byte-identical output.
+#[test]
+fn multi_pass_differential() {
+    let dir = std::env::temp_dir().join("e2e_multipass");
+    let _ = std::fs::remove_dir_all(&dir);
+    write_inputs(&dir.join("in"));
+
+    let mut results = Vec::new();
+    for (i, (nh, ng)) in [(false, false), (true, true)].iter().enumerate() {
+        let out_dir = dir.join(format!("p{i}"));
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let mut files = file_info_for(&dir.join("in"), &["f1.bin", "f2.bin"]);
+        results.push(
+            generate_opts(
+                &mut files,
+                &out_dir.join("mp"),
+                8192.0,
+                Some(524288.0),
+                256.0,
+                MethodRef::Name("".into()),
+                *nh,
+                *ng,
+                |_| {},
+            )
+            .unwrap(),
+        );
+    }
+    assert_eq!(
+        results[0], results[1],
+        "multi-pass output differs between FFI and native pipelines"
+    );
+}
+
+/// Edge-input tree through the native pipeline, verified independently by
+/// par2cmdline. Includes a unicode filename - exercises the non-ASCII
+/// packet path against a real decoder. (0-byte files and `/` in recorded
+/// names are covered by the golden/differential tests instead: par2cmdline
+/// misreports both even on upstream-JS output.)
+#[test]
+fn edge_inputs_par2() {
+    let Some(par2) = par2_bin() else {
+        eprintln!("par2cmdline not in PATH - skipping edge-input verify");
+        return;
+    };
+    let dir = std::env::temp_dir().join("e2e_edge_par2");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("exact.bin"), vec![0xabu8; 4096]).unwrap();
+    std::fs::write(dir.join("tiny.bin"), vec![7u8; 1000]).unwrap();
+    std::fs::write(dir.join("uni-\u{20ac}.bin"), vec![3u8; 9000]).unwrap();
+
+    let names = ["exact.bin", "tiny.bin", "uni-\u{20ac}.bin"];
+    let mut files = file_info_for(&dir, &names);
+    generate(
+        &mut files,
+        &dir.join("edge"),
+        MethodRef::Name("".into()),
+        4.0,
+    )
+    .unwrap();
+
+    let st = std::process::Command::new(&par2)
+        .arg("v")
+        .arg("edge.par2")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "par2 verify failed on edge-input set:\n{}\n{}",
+        String::from_utf8_lossy(&st.stdout),
+        String::from_utf8_lossy(&st.stderr)
+    );
+}
+
+/// Seeded randomized differential: random file trees x random option
+/// combos through the FFI pipeline vs the native pipeline. Byte-identical
+/// output on success; identical error text on failure.
+#[test]
+fn randomized_differential() {
+    let mut rng = 0xC0FFEEu64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let pick = |n: u64, r: &mut dyn FnMut() -> u64| (r() % n) as usize;
+    let sizes = [0usize, 500, 4096, 5000, 40000, 130000];
+    let slices = [512.0, 1024.0, 4096.0, 8192.0, 16384.0];
+    let mems = [None, Some(16384.0), Some(65536.0), Some(262144.0)];
+    let schemes = ["pow2", "uniform", "equal"];
+    let disps = ["common", "basename", "keep", "path"];
+    let unicodes = [None, Some(true), Some(false)];
+
+    for case in 0..40u32 {
+        let dir = std::env::temp_dir().join(format!("e2e_rand_{case}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let in_dir = dir.join("in");
+        std::fs::create_dir_all(&in_dir).unwrap();
+
+        let n_files = 1 + pick(4, &mut next);
+        let mut names = Vec::new();
+        for fi in 0..n_files {
+            let name = if case % 5 == 4 && fi == 0 {
+                format!("u\u{20ac}{fi}.bin")
+            } else {
+                format!("f{fi}.bin")
+            };
+            let size = sizes[pick(6, &mut next)];
+            let data: Vec<u8> = (0..size).map(|_| (next() >> 33) as u8).collect();
+            std::fs::write(in_dir.join(&name), data).unwrap();
+            names.push(name);
+        }
+        let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+
+        let slice = slices[pick(5, &mut next)];
+        let rec = (next() % 13) as f64;
+        let mem = mems[pick(4, &mut next)];
+        let scheme = schemes[pick(3, &mut next)];
+        let disp = disps[pick(4, &mut next)];
+        let uni = unicodes[pick(3, &mut next)];
+        let offset = (next() % 5) as i32;
+        let comment = if case % 7 == 3 {
+            Some(format!("cmt{case}"))
+        } else {
+            None
+        };
+
+        let mut results = Vec::new();
+        for (i, (nh, ng)) in [(false, false), (true, true)].iter().enumerate() {
+            let out_dir = dir.join(format!("o{i}"));
+            std::fs::create_dir_all(&out_dir).unwrap();
+            let mut files = file_info_for(&in_dir, &name_refs);
+            let comment = comment.clone();
+            results.push(generate_opts(
+                &mut files,
+                &out_dir.join("r"),
+                slice,
+                mem,
+                rec,
+                MethodRef::Name("".into()),
+                *nh,
+                *ng,
+                move |o| {
+                    o.output_size_scheme = scheme.into();
+                    o.display_name_format = disp.into();
+                    o.unicode = uni;
+                    o.recovery_offset = offset;
+                    if let Some(c) = comment {
+                        o.comments = vec![c];
+                    }
+                },
+            ));
+        }
+        match (&results[0], &results[1]) {
+            (Ok(ffi), Ok(native)) => assert_eq!(
+                ffi, native,
+                "case {case}: FFI vs native output differs (slice={slice} rec={rec} mem={mem:?} scheme={scheme} disp={disp} uni={uni:?} off={offset})"
+            ),
+            (Err(a), Err(b)) => assert_eq!(
+                a, b,
+                "case {case}: error text differs: FFI `{a}` vs native `{b}`"
+            ),
+            (a, b) => panic!(
+                "case {case}: outcome mismatch (slice={slice} rec={rec} mem={mem:?}): FFI {a:?} vs native {b:?}",
+                a = a.as_ref().map(|_| "ok"),
+                b = b.as_ref().map(|_| "ok")
+            ),
+        }
+    }
+}
+
+/// CLI-level error parity vs the JS CLI: identical exit codes and stderr
+/// for missing files, bad specs, unknown flags. Skips without node.
+#[test]
+fn cli_error_parity() {
+    if js_cli().is_none() {
+        eprintln!("no JS CLI - skipping CLI error parity");
+        return;
+    }
+    let rust_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_parpar"));
+    let js = js_cli().unwrap();
+    let dir = std::env::temp_dir().join("e2e_clierr");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let cases: Vec<Vec<String>> = vec![
+        // missing input file
+        vec!["-q", "-s4K", "-r3", "-o", "x", "nope.bin"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        // missing slice spec
+        vec!["-q", "-o", "x", "nope.bin"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        // bad slice spec value
+        vec!["-q", "-sbanana", "-r3", "-o", "x", "nope.bin"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        // unknown flag
+        vec![
+            "-q",
+            "--definitely-not-an-option",
+            "-s4K",
+            "-r3",
+            "-o",
+            "x",
+            "nope.bin",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+        // unknown gf method
+        vec!["-q", "-s4K", "-r3", "-mnope", "-o", "x", "nope.bin"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    ];
+
+    for (i, args) in cases.iter().enumerate() {
+        let js_out = std::process::Command::new("node")
+            .arg(&js)
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let rs_out = std::process::Command::new(&rust_bin)
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert_eq!(
+            js_out.status.code(),
+            rs_out.status.code(),
+            "case {i} {args:?}: exit code differs (js={:?} rust={:?})\njs stderr: {}\nrs stderr: {}",
+            js_out.status.code(),
+            rs_out.status.code(),
+            String::from_utf8_lossy(&js_out.stderr),
+            String::from_utf8_lossy(&rs_out.stderr)
+        );
+        assert_eq!(
+            js_out.stderr,
+            rs_out.stderr,
+            "case {i} {args:?}: stderr differs\njs: {}\nrs: {}",
+            String::from_utf8_lossy(&js_out.stderr),
+            String::from_utf8_lossy(&rs_out.stderr)
+        );
+    }
 }

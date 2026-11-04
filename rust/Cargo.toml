@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/parpar",
     "crates/parpar-backend",
+    "crates/parpar-e2e-native",
     "crates/parpar-gf16",
     "crates/parpar-hasher",
     "crates/parpar-ocl",

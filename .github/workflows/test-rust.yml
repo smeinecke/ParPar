@@ -45,7 +45,7 @@ jobs:
         working-directory: rust
       - name: cargo test (native crates)
         if: matrix.ffi == ''
-        run: cargo test -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl
+        run: cargo test -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl -p parpar-e2e-native
         working-directory: rust
       - name: cargo build --no-default-features
         if: matrix.ffi == ''
@@ -66,7 +66,7 @@ jobs:
           workspaces: rust
       # gnu dev-deps build the C++ oracle (parpar-sys) which needs libuv
       - run: sudo apt-get update && sudo apt-get install -y libuv1-dev par2cmdline
-      - run: cargo test -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl
+      - run: cargo test -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl -p parpar-e2e-native
         working-directory: rust
       - run: cargo build --release --no-default-features -p parpar
         working-directory: rust
@@ -154,7 +154,7 @@ jobs:
           apt-get download qemu-user
           dpkg-deb -x qemu-user_*.deb root
       - name: aarch64 NEON/CLMul/SHA3 tests
-        run: cargo test --target aarch64-unknown-linux-musl -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl
+        run: cargo test --target aarch64-unknown-linux-musl -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl -p parpar-e2e-native
         working-directory: rust
       - name: aarch64 e2e generation
         run: |
@@ -164,7 +164,7 @@ jobs:
           test -f /tmp/qarm.par2
         working-directory: rust
       - name: riscv64 scalar tests
-        run: cargo test --target riscv64gc-unknown-linux-musl -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl
+        run: cargo test --target riscv64gc-unknown-linux-musl -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl -p parpar-e2e-native
         working-directory: rust
 
   # AVX512/VBMI/GFNI kernel coverage under Intel SDE (-spr model emulates
