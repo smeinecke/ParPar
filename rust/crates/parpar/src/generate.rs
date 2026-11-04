@@ -2099,12 +2099,19 @@ enum SliceRef {
 // ---------------------------------------------------------------------------
 
 /// `path.resolve` for POSIX paths - resolves the argument against cwd and
-/// normalizes dot segments.
+/// normalizes dot segments. On Windows, `\` is folded to `/` and
+/// drive-letter (`C:/`) + UNC (`//`) forms count as absolute.
 fn path_resolve(p: &str) -> String {
     let cwd = std::env::current_dir()
         .map(|d| d.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| "/".to_string());
-    let joined = if p.starts_with('/') {
+    #[cfg(windows)]
+    let p = &*p.replace('\\', "/");
+    #[cfg(windows)]
+    let absolute = p.starts_with('/') || (p.len() >= 3 && p.as_bytes()[1] == b':' && p.as_bytes()[2] == b'/');
+    #[cfg(not(windows))]
+    let absolute = p.starts_with('/');
+    let joined = if absolute {
         p.to_string()
     } else {
         format!("{}/{}", cwd.trim_end_matches('/'), p)
@@ -2143,6 +2150,8 @@ fn path_relative(from: &str, to: &str) -> String {
 
 /// `path.basename` (POSIX) - trailing slashes ignored.
 fn path_basename(p: &str) -> String {
+    #[cfg(windows)]
+    let p = &*p.replace('\\', "/");
     let s = p.trim_end_matches('/');
     match s.rfind('/') {
         Some(i) => s[i + 1..].to_string(),
@@ -2152,6 +2161,8 @@ fn path_basename(p: &str) -> String {
 
 /// `path.dirname` (POSIX).
 fn path_dirname(p: &str) -> String {
+    #[cfg(windows)]
+    let p = &*p.replace('\\', "/");
     if p == "/" {
         return "/".to_string();
     }
