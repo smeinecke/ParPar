@@ -831,10 +831,7 @@ where
         match inner.backend.wait_event(0) {
             Some((pid, ev)) => {
                 inner.stash.entry(pid).or_default().push_back(ev);
-                Ok(inner
-                    .stash
-                    .get_mut(&proc_id)
-                    .and_then(|q| q.pop_front()))
+                Ok(inner.stash.get_mut(&proc_id).and_then(|q| q.pop_front()))
             }
             None => Ok(None),
         }

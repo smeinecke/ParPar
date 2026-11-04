@@ -43,10 +43,13 @@ impl BackendError {
 
 /// Buffer type moved into and out of the backend.
 /// `len` tracks the meaningful bytes; the allocation may be larger.
-#[derive(Debug)]
 pub struct SliceBuf {
     pub data: Box<[u8]>,
     pub len: usize,
+    /// invoked with the storage Vec when the SliceBuf is dropped - lets an
+    /// origin buffer pool (e.g. the reader's) reclaim it instead of freeing
+    #[doc(hidden)]
+    pub reclaim: Option<Box<dyn FnOnce(Vec<u8>) + Send>>,
 }
 
 impl SliceBuf {
@@ -54,13 +57,56 @@ impl SliceBuf {
         // hard invariant - as_bytes() would panic anyway; fail at
         // construction so the blame lands on the caller
         assert!(len <= data.len(), "SliceBuf len exceeds allocation");
-        SliceBuf { data, len }
+        SliceBuf {
+            data,
+            len,
+            reclaim: None,
+        }
+    }
+    /// Attach a reclaim callback; when this SliceBuf drops the storage Vec
+    /// is handed to `f` instead of the allocator.
+    pub fn with_reclaim(mut self, f: impl FnOnce(Vec<u8>) + Send + 'static) -> Self {
+        self.reclaim = Some(Box::new(f));
+        self
+    }
+    /// Hand the storage Vec to the reclaim callback immediately (if set),
+    /// leaving an empty buffer behind for bookkeeping. Called once the
+    /// backend has consumed the bytes (e.g. after kernel prepare) so the
+    /// origin pool can reuse the storage without waiting for InputDone.
+    pub fn release_storage(&mut self) {
+        if let Some(r) = self.reclaim.take() {
+            r(std::mem::take(&mut self.data).into_vec());
+        }
+    }
+    /// Consume into the storage Vec, discarding any reclaim callback.
+    pub fn into_vec(mut self) -> Vec<u8> {
+        let data = std::mem::take(&mut self.data).into_vec();
+        drop(self.reclaim.take());
+        std::mem::forget(self);
+        data
     }
     pub fn as_bytes(&self) -> &[u8] {
         &self.data[..self.len]
     }
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         &mut self.data[..self.len]
+    }
+}
+
+impl std::fmt::Debug for SliceBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SliceBuf")
+            .field("data", &self.data)
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SliceBuf {
+    fn drop(&mut self) {
+        if let Some(r) = self.reclaim.take() {
+            r(std::mem::take(&mut self.data).into_vec());
+        }
     }
 }
 

@@ -855,7 +855,7 @@ fn selftest() -> i32 {
                 "  output {}: {} bytes cksum_valid={} sum={:08x}",
                 idx, buf.len, cksum_valid, md
             );
-            rec[idx] = buf.data.into_vec();
+            rec[idx] = buf.into_vec();
             fetched += 1;
         }
     }

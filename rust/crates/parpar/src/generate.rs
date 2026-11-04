@@ -1558,8 +1558,7 @@ impl<C: GfCtx> Par2Gen<C> {
                     let dir = path_dirname(&sysinfo::path_normalize(&full));
                     // path_dirname always returns '/'-separated paths (even
                     // on Windows) - split on '/', not the platform sep
-                    let parts: Vec<String> =
-                        dir.split('/').map(|s| s.to_string()).collect();
+                    let parts: Vec<String> = dir.split('/').map(|s| s.to_string()).collect();
                     match &mut common_root {
                         None => common_root = Some(parts),
                         Some(root) => {
@@ -2104,7 +2103,8 @@ fn path_resolve(p: &str) -> String {
     #[cfg(windows)]
     let p = &*p.replace('\\', "/");
     #[cfg(windows)]
-    let absolute = p.starts_with('/') || (p.len() >= 3 && p.as_bytes()[1] == b':' && p.as_bytes()[2] == b'/');
+    let absolute =
+        p.starts_with('/') || (p.len() >= 3 && p.as_bytes()[1] == b':' && p.as_bytes()[2] == b'/');
     #[cfg(not(windows))]
     let absolute = p.starts_with('/');
     let joined = if absolute {

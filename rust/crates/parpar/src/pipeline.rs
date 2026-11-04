@@ -747,7 +747,8 @@ impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
                             cb_progress(Progress::ProcessingSlice(fidx, slice_pos));
                             let len = data.buffer.len();
                             let buf =
-                                SliceBuf::new(std::mem::take(&mut data.buffer).into_boxed_slice(), len);
+                                SliceBuf::new(std::mem::take(&mut data.buffer).into_boxed_slice(), len)
+                                    .with_reclaim(data.buf_reclaimer());
                             let f = &mut self.gen.par2.files[fidx];
                             let gen = &mut self.gen.par2.gen;
                             if let Err(e) = f.process_data(gen, buf) {

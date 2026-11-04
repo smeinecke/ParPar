@@ -77,6 +77,10 @@ struct Shared {
     closed: AtomicBool,
     /// worker exited - sends fail fast instead of queueing forever
     worker_dead: AtomicBool,
+    /// recycled per-slice packed staging buffers: the worker returns them
+    /// when a batch flushes so add_input avoids a 4MB alloc+memset per
+    /// slice (C++ keeps fixed staging slots instead)
+    packed_pool: Mutex<Vec<Vec<u8>>>,
 }
 
 enum Cmd {
@@ -274,6 +278,15 @@ impl Worker {
         // staging freed: buffers return to the pool and the pending count
         // drops - this is what lets a Full add_input succeed on retry
         let n = staged.len();
+        {
+            let mut pool = shared.packed_pool.lock().unwrap();
+            for inp in staged.iter_mut() {
+                let packed = std::mem::take(&mut inp.packed);
+                if pool.len() < 64 && packed.capacity() > 0 {
+                    pool.push(packed);
+                }
+            }
+        }
         for inp in staged {
             emit(ProcEvent::InputDone {
                 token: inp.token,
@@ -368,6 +381,7 @@ impl NativeGfProc {
             progress_on: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             worker_dead: AtomicBool::new(false),
+            packed_pool: Mutex::new(Vec::new()),
         });
 
         let (tx, rx) = channel::<Cmd>();
@@ -687,8 +701,27 @@ impl GfProc for NativeGfProc {
         // addInput) so the worker only does the multiply. Stage at the max
         // allocated slice size like C++ staging; the work loop additionally
         // clamps reads to packed.len() for grows after staging.
-        let mut packed = vec![0u8; packed_len(&*self.kernel, self.slice_size as usize)];
+        let plen = packed_len(&*self.kernel, self.slice_size as usize);
+        let mut packed = self
+            .shared
+            .packed_pool
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_default();
+        packed.clear();
+        packed.reserve(plen);
+        // every kernel prepare() fully writes dst[..plen] (packed data or
+        // explicit zero-pad) so initialising from the pool is unobservable
+        unsafe {
+            packed.set_len(plen);
+        }
         self.kernel.prepare(&mut packed, &buf.data[..buf.len]);
+        // the raw input is packed now - the storage isn't needed by the
+        // worker; return it to the origin pool (e.g. reader buffers) here
+        // instead of at InputDone so the pool can't starve on the way
+        let mut buf = buf;
+        buf.release_storage();
         self.shared.pending.fetch_add(1, Ordering::AcqRel);
         if let Err(e) = self.send(Cmd::Input(StagedInput {
             buf,
@@ -873,7 +906,8 @@ mod tests {
             .add_input(
                 SliceBuf {
                     data: vec![1u8; 32].into_boxed_slice(),
-                    len: 64
+                    len: 64,
+                    reclaim: None
                 },
                 0,
                 2

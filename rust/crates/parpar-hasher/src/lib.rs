@@ -27,6 +27,9 @@ pub fn inhash_method_name() -> &'static str {
     {
         // SSE2 md5x2 is always used on x86_64; the CRC half is PCLMUL only
         // when the CPU supports it
+        if std::arch::is_x86_feature_detected!("bmi1") && crc32::clmul::available() {
+            return "BMI1+PCLMUL";
+        }
         return if crc32::clmul::available() {
             "SSE2+PCLMUL"
         } else {

@@ -230,8 +230,11 @@ impl FileReaderData {
             }
         }
         if self.refs == 0 {
+            st.lent_bufs = st.lent_bufs.saturating_sub(1);
             let buf = std::mem::take(&mut self.buffer);
-            st.buf.push(buf);
+            if buf.len() as u64 >= self.reader.read_size {
+                st.buf.push(buf);
+            }
             self.reader.cv.notify_one();
         }
     }
@@ -240,9 +243,31 @@ impl FileReaderData {
         self.refs -= 1;
         if self.refs == 0 {
             let mut st = self.reader.state.lock().unwrap();
+            st.lent_bufs = st.lent_bufs.saturating_sub(1);
             let buf = std::mem::take(&mut self.buffer);
-            st.buf.push(buf);
+            // undersized/empty buffers never re-enter the pool - the
+            // zero-copy path empties `buffer` when it moves into a
+            // SliceBuf; that storage returns via its reclaim callback
+            if buf.len() as u64 >= self.reader.read_size {
+                st.buf.push(buf);
+            }
             self.reader.cv.notify_one();
+        }
+    }
+
+    /// Reclaim closure for the zero-copy slice handoff: the pooled buffer
+    /// travels inside a SliceBuf and is pushed back here when the backend
+    /// drops it (the C++ backend returns read buffers to the pool in the
+    /// same way).
+    pub fn buf_reclaimer(&self) -> impl FnOnce(Vec<u8>) + Send {
+        let inner = self.reader.clone();
+        move |v: Vec<u8>| {
+            if v.len() as u64 >= inner.read_size {
+                let mut st = inner.state.lock().unwrap();
+                st.buf.push(v);
+                drop(st);
+                inner.cv.notify_one();
+            }
         }
     }
 }
@@ -269,6 +294,12 @@ struct OpenFile {
 struct SeqState {
     buf: Vec<Vec<u8>>,
     buf_count: usize,
+    /// read slots currently lent out (incremented at get_buf, decremented
+    /// when the slot is released via hashed()+release() refs hitting 0 or
+    /// when the buffer is parked back) - the run-finish check needs this:
+    /// real storage may still sit inside a SliceBuf in the proc while its
+    /// slot is already released
+    lent_bufs: usize,
     open_files: Vec<OpenFile>,
     file_queue: VecDeque<usize>,
     next_slot: u64,
@@ -302,6 +333,7 @@ impl FileSeqReader {
                 state: Mutex::new(SeqState {
                     buf: Vec::new(),
                     buf_count: 0,
+                    lent_bufs: 0,
                     open_files: Vec::new(),
                     file_queue,
                     next_slot: 1,
@@ -352,12 +384,14 @@ impl FileSeqReader {
     fn get_buf(&self, st: &mut SeqState) -> Option<Vec<u8>> {
         while let Some(buf) = st.buf.pop() {
             if buf.len() as u64 >= self.inner.read_size {
+                st.lent_bufs += 1;
                 return Some(buf);
             }
             st.buf_count -= 1;
         }
         if st.buf_count < self.inner.max_bufs {
             st.buf_count += 1;
+            st.lent_bufs += 1;
             return Some(vec![0u8; self.inner.read_size as usize]);
         }
         None
@@ -397,6 +431,39 @@ impl FileSeqReader {
         throttle: Option<&ThrottleQueue>,
         mut cb: impl FnMut(JsResult<FileReaderData>),
     ) -> JsResult<()> {
+        // JS performs the reads on background workers while the main loop
+        // hashes; replicate that overlap with a scoped producer thread so
+        // the pread of chunk N+1 hides under the hashing of chunk N
+        let chan_bound = self.inner.state.lock().unwrap().buf_count.max(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<JsResult<FileReaderData>>(chan_bound);
+        let mut first_err: Option<String> = None;
+        std::thread::scope(|s| {
+            let producer = s.spawn(|| self.produce(throttle, tx));
+            for item in rx {
+                let is_err = item.is_err();
+                if let Err(e) = &item {
+                    if first_err.is_none() {
+                        first_err = Some(e.clone());
+                    }
+                }
+                cb(item);
+                if is_err {
+                    break;
+                }
+            }
+            let _ = producer.join();
+        });
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    fn produce(
+        &mut self,
+        throttle: Option<&ThrottleQueue>,
+        tx: std::sync::mpsc::SyncSender<JsResult<FileReaderData>>,
+    ) {
         let no_throttle;
         let throttle = match throttle {
             Some(t) => t,
@@ -459,15 +526,17 @@ impl FileSeqReader {
                                     hash_queue: 0,
                                     slot,
                                 });
+                                st.lent_bufs = st.lent_bufs.saturating_sub(1);
                                 st.buf.push(buffer);
                             }
                             Err(e) => {
                                 let msg = crate::compat::fs_io_error(&e, "open", &name);
                                 let mut st = self.inner.state.lock().unwrap();
+                                st.lent_bufs = st.lent_bufs.saturating_sub(1);
                                 st.buf.push(buffer);
                                 drop(st);
-                                cb(Err(msg.clone()));
-                                return Err(msg);
+                                let _ = tx.send(Err(msg));
+                                return;
                             }
                         }
                         continue;
@@ -475,9 +544,10 @@ impl FileSeqReader {
                         // nothing readable - park the buffer; JS finishCb
                         // also waits for every lent buffer to come back via
                         // hashed()+release()
+                        st.lent_bufs = st.lent_bufs.saturating_sub(1);
                         st.buf.push(buffer);
-                        if st.open_files.is_empty() && st.buf.len() >= st.buf_count {
-                            return Ok(());
+                        if st.open_files.is_empty() && st.lent_bufs == 0 {
+                            return;
                         }
                         st = self.inner.cv.wait(st).unwrap();
                         continue;
@@ -491,10 +561,18 @@ impl FileSeqReader {
                 let (rs, chunks) = self.read_size(ofile.pos, self.files[ofile.info].size);
                 (rs, chunks, ofile.pos, ofile.info)
             };
-            let fd = st.open_files[file_idx]
-                .fd
-                .try_clone()
-                .map_err(|e| e.to_string())?;
+            let fd = match st.open_files[file_idx].fd.try_clone() {
+                Ok(fd) => fd,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let mut st = self.inner.state.lock().unwrap();
+                    st.lent_bufs = st.lent_bufs.saturating_sub(1);
+                    st.buf.push(buffer);
+                    drop(st);
+                    let _ = tx.send(Err(msg));
+                    return;
+                }
+            };
             drop(st);
 
             let (cancelled, _done) = throttle.pass(rs as f64);
@@ -502,8 +580,10 @@ impl FileSeqReader {
                 // a cancelled throttle cancels every pass - continuing here
                 // would spin forever on the same buffer
                 let mut st = self.inner.state.lock().unwrap();
+                st.lent_bufs = st.lent_bufs.saturating_sub(1);
                 st.buf.push(buffer);
-                return Err("read cancelled".to_string());
+                let _ = tx.send(Err("read cancelled".to_string()));
+                return;
             }
 
             let mut buffer = buffer;
@@ -515,11 +595,12 @@ impl FileSeqReader {
                     // finish check even though run() returns Err
                     {
                         let mut st = self.inner.state.lock().unwrap();
+                        st.lent_bufs = st.lent_bufs.saturating_sub(1);
                         st.buf.push(buffer);
                     }
                     let msg = crate::compat::fs_io_error(&e, "read", &self.files[info].name);
-                    cb(Err(msg.clone()));
-                    return Err(msg);
+                    let _ = tx.send(Err(msg));
+                    return;
                 }
             };
 
@@ -530,8 +611,8 @@ impl FileSeqReader {
                     "Read past expected end of file - latest position ({}) exceeds size ({})",
                     new_pos, fsize
                 );
-                cb(Err(msg.clone()));
-                return Err(msg);
+                let _ = tx.send(Err(msg));
+                return;
             }
             let eof = new_pos == fsize;
             if !eof && n as u64 != rs {
@@ -539,8 +620,8 @@ impl FileSeqReader {
                     "Read failure - expected {} bytes, got {} bytes instead.",
                     rs, n
                 );
-                cb(Err(msg.clone()));
-                return Err(msg);
+                let _ = tx.send(Err(msg));
+                return;
             }
 
             let mut st = self.inner.state.lock().unwrap();
@@ -561,7 +642,9 @@ impl FileSeqReader {
             buffer.truncate(n);
             ret.buffer = buffer;
             drop(st);
-            cb(Ok(ret));
+            if tx.send(Ok(ret)).is_err() {
+                return;
+            }
 
             if eof {
                 let mut st = self.inner.state.lock().unwrap();
