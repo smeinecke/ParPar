@@ -6,8 +6,8 @@
 use parpar::args::{SpecExpr, SpecTerm, SpecUnit};
 use parpar::cliparse::{ThrottleMode, ThrottleSpec};
 use parpar::fileinfo::FileInfo;
-use parpar::generate::{CritScheme, GenOpts, OclDevOpt, Par2Gen, SysEnv};
-use parpar::par2::SharedBackend;
+use parpar::generate::{CritScheme, GenOpts, OclDevOpt, Par2Gen, SolverInfo, SysEnv};
+use parpar::par2::{method_num_ref, SharedBackend, GF_METHODS};
 use parpar_ffi::FfiBackend;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -313,6 +313,23 @@ fn cmp(path: &str, expect: &Value, got: &Value, errs: &mut Vec<String>) {
     }
 }
 
+// `auto` gfMethod resolves to whatever kernel the host CPU picks, so the
+// oracle's resolved method ids are machine-dependent - scrub them
+fn scrub_auto_method(v: &mut Value) {
+    if let Some(c) = v.get_mut("procCpu").and_then(|c| c.as_object_mut()) {
+        c.insert("method".into(), 0.into());
+    }
+    for key in ["openclDevices", "procOcl"] {
+        if let Some(arr) = v.get_mut(key).and_then(|a| a.as_array_mut()) {
+            for d in arr.iter_mut() {
+                if let Some(o) = d.as_object_mut() {
+                    o.insert("cksum_method".into(), 0.into());
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn solver_layout_differential() {
     let dir = fixture_dir();
@@ -321,6 +338,7 @@ fn solver_layout_differential() {
     let backend = FfiBackend::new().unwrap();
     let mut failures = Vec::new();
     let mut ran = 0;
+    let mut skipped = 0;
     for (i, case) in cases.iter().enumerate() {
         let id = case["id"].as_str().unwrap().to_string();
         let fx_path = dir.join(format!("{i}_{id}.json"));
@@ -365,6 +383,22 @@ fn solver_layout_differential() {
 
         let mut shared = SharedBackend::new(backend.clone());
         eprintln!("CASE {i} {id}");
+        // OCL fixtures encode the generator machine's resolved device - where
+        // one can't be resolved the case can't be reproduced (JS itself throws
+        // 'Unable to obtain OpenCL device info'); skip unless that failure is
+        // exactly what the oracle expects
+        let ocl_ok = opts
+            .opencl_devices
+            .iter()
+            .all(|d| shared.ocl_device_info(d.platform, d.device).is_some());
+        if !ocl_ok && expect["error"].as_str() != Some("Unable to obtain OpenCL device info") {
+            skipped += 1;
+            continue;
+        }
+        let auto_method = match &opts.gf_method {
+            Some(m) => method_num_ref(GF_METHODS, m).ok() == Some(0),
+            None => false,
+        };
         let result = Par2Gen::new(
             &mut files,
             &slice_def,
@@ -390,9 +424,14 @@ fn solver_layout_differential() {
             )),
             (None, Err(e)) => failures.push(format!("{id}: Rust errored: {e}")),
             (None, Ok(gen)) => {
-                let got = gen.dump();
+                let mut expect_v = expect.clone();
+                let mut got = gen.dump();
+                if auto_method {
+                    scrub_auto_method(&mut expect_v);
+                    scrub_auto_method(&mut got);
+                }
                 let mut errs = Vec::new();
-                cmp("out", expect, &got, &mut errs);
+                cmp("out", &expect_v, &got, &mut errs);
                 for e in errs {
                     failures.push(format!("{id}: {e}"));
                 }
@@ -401,7 +440,7 @@ fn solver_layout_differential() {
     }
     assert!(
         failures.is_empty(),
-        "{} failures (of {ran}):\n{}",
+        "{} failures (of {ran}, {skipped} skipped):\n{}",
         failures.len(),
         failures[..failures.len().min(40)].join("\n")
     );
