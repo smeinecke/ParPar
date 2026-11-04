@@ -6,10 +6,27 @@
 use parpar::args::Recurse;
 use parpar::fileinfo::file_info;
 use serde_json::Value;
+use std::os::unix::fs::FileTypeExt;
 
 const ORACLE_PREFIX: &str = "/home/stefan/github/ParPar/rust/fixtures/tree";
 
+/// Git cannot store the fifo (special file) or the empty `nodesc` dir -
+/// recreate them on first use so a fresh checkout scans identically.
+fn ensure_fixtures() {
+    let dir = format!("{}/../../fixtures/tree", env!("CARGO_MANIFEST_DIR"));
+    let _ = std::fs::create_dir(format!("{}/nodesc", dir));
+    let fifo = format!("{}/fifo", dir);
+    match std::fs::symlink_metadata(&fifo) {
+        Ok(m) if m.file_type().is_fifo() => {}
+        _ => unsafe {
+            let c = std::ffi::CString::new(fifo.as_str()).unwrap();
+            libc::mkfifo(c.as_ptr(), 0o644);
+        },
+    }
+}
+
 fn tree() -> String {
+    ensure_fixtures();
     std::fs::canonicalize(format!(
         "{}/../../fixtures/tree",
         env!("CARGO_MANIFEST_DIR")

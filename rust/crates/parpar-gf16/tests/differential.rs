@@ -408,7 +408,15 @@ fn multithreaded() {
             parpar_gf16::kernel::method::LOOKUP,
             parpar_gf16::kernel::method::SHUFFLE_AVX2,
             parpar_gf16::kernel::method::XORJIT_AVX2,
+            // aarch64 kernels - exercised where the ISA exists, skipped
+            // elsewhere (pick_explicit is the arch gate)
+            4,
+            28,
+            29,
         ] {
+            if parpar_gf16::kernel::pick_explicit(m).is_none() {
+                continue;
+            }
             run_case_t(
                 m,
                 20000,

@@ -85,8 +85,8 @@ fn e2e_gen_matches_js() {
 
     // JS oracle (generated once; regenerate deterministically)
     let js_dir = std::env::temp_dir().join("e2e");
-    if !js_dir.join("out.par2").exists() {
-        // recreate inputs the JS run used
+    {
+        // recreate inputs the JS runs used
         std::fs::create_dir_all(js_dir.join("in")).unwrap();
         std::fs::write(
             js_dir.join("in/a.bin"),
@@ -96,9 +96,22 @@ fn e2e_gen_matches_js() {
         std::fs::write(js_dir.join("in/b.bin"), vec![b'x'; 1000]).unwrap();
         let a = js_dir.join("in/a.bin");
         let b = js_dir.join("in/b.bin");
-        if !oracle_gen(&js_dir.join("out.par2"), &["-s512B", "-r3"], &[&a, &b]) {
-            eprintln!("e2e_gen: no oracle available (node+addon or FFI bin) - skipping");
-            return;
+        // every compared base needs an oracle output - a stale cache from
+        // an earlier checkout may hold only a subset, so check each one
+        for (base, args) in [
+            ("out", vec!["-s512B", "-r3"]),
+            (
+                "outc",
+                vec!["-s64K", "-r3", "-m64K", "--min-chunk-size", "1K"],
+            ),
+        ] {
+            if js_dir.join(format!("{}.par2", base)).exists() {
+                continue;
+            }
+            if !oracle_gen(&js_dir.join(format!("{}.par2", base)), &args, &[&a, &b]) {
+                eprintln!("e2e_gen: no oracle available (node+addon or FFI bin) - skipping");
+                return;
+            }
         }
     }
 
@@ -159,25 +172,27 @@ fn e2e_gen_matches_js() {
 
     // larger multi-slice inputs (JS oracle: big.* / mp.*)
     let in2 = js_dir.join("in2");
-    if !in2.join("big.bin").exists() {
-        std::fs::create_dir_all(&in2).unwrap();
-        let mut rng = 0x2au32;
-        let mut next = move || {
-            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
-            (rng >> 16) as u8
-        };
-        std::fs::write(
-            in2.join("big.bin"),
-            (0..400 * 1024).map(|_| next()).collect::<Vec<u8>>(),
-        )
-        .unwrap();
-        std::fs::write(
-            in2.join("med.bin"),
-            (0..150 * 1024)
-                .map(|i| (i * 7 & 0xff) as u8)
-                .collect::<Vec<u8>>(),
-        )
-        .unwrap();
+    {
+        if !in2.join("big.bin").exists() {
+            std::fs::create_dir_all(&in2).unwrap();
+            let mut rng = 0x2au32;
+            let mut next = move || {
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                (rng >> 16) as u8
+            };
+            std::fs::write(
+                in2.join("big.bin"),
+                (0..400 * 1024).map(|_| next()).collect::<Vec<u8>>(),
+            )
+            .unwrap();
+            std::fs::write(
+                in2.join("med.bin"),
+                (0..150 * 1024)
+                    .map(|i| (i * 7 & 0xff) as u8)
+                    .collect::<Vec<u8>>(),
+            )
+            .unwrap();
+        }
         for (base, args) in [
             (
                 "big",
@@ -188,6 +203,9 @@ fn e2e_gen_matches_js() {
                 vec!["-s256K", "-r10", "-m1600K", "--min-chunk-size", "64K"],
             ),
         ] {
+            if js_dir.join(format!("{}.par2", base)).exists() {
+                continue;
+            }
             let big = in2.join("big.bin");
             let med = in2.join("med.bin");
             if !oracle_gen(&js_dir.join(format!("{}.par2", base)), &args, &[&big, &med]) {
