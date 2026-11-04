@@ -29,7 +29,8 @@ jobs:
           # macOS both arches, Windows x86_64
           - { os: macos-15-intel,   target: x86_64-apple-darwin,  slug: macos-amd64 }
           - { os: macos-14,         target: aarch64-apple-darwin, slug: macos-arm64 }
-          - { os: windows-latest,   target: x86_64-pc-windows-msvc, slug: win64 }
+          # 'windows-amd64' not 'win64': JS build.yml already owns '-win64.7z'
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc, slug: windows-amd64 }
     name: rust binary (${{ matrix.slug }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -54,7 +55,7 @@ jobs:
       - name: package (unix)
         if: runner.os != 'Windows'
         env:
-          ASSET: parpar-${{ env.TAG }}-rust-${{ matrix.slug }}
+          ASSET: parpar-${{ env.TAG }}-${{ matrix.slug }}
         run: |
           cp target/${{ matrix.target }}/release/parpar parpar
           tar -cJf "${ASSET}.tar.xz" parpar
@@ -63,7 +64,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          ASSET: parpar-${{ env.TAG }}-rust-${{ matrix.slug }}
+          ASSET: parpar-${{ env.TAG }}-${{ matrix.slug }}
         run: |
           Copy-Item target/${{ matrix.target }}/release/parpar.exe parpar.exe
           7z a -t7z -mx=9 "${env:ASSET}.7z" parpar.exe
@@ -71,7 +72,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: rust-bin-${{ matrix.slug }}
-          path: rust/parpar-${{ env.TAG }}-rust-${{ matrix.slug }}.*
+          path: rust/parpar-${{ env.TAG }}-${{ matrix.slug }}.*
           compression-level: 0 # already compressed
       - name: Get release
         if: github.event_name == 'release'
@@ -86,8 +87,8 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         with:
           upload_url: ${{ steps.get_release.outputs.upload_url }}
-          asset_path: rust/parpar-${{ env.TAG }}-rust-${{ matrix.slug }}.tar.xz
-          asset_name: parpar-${{ env.TAG }}-rust-${{ matrix.slug }}.tar.xz
+          asset_path: rust/parpar-${{ env.TAG }}-${{ matrix.slug }}.tar.xz
+          asset_name: parpar-${{ env.TAG }}-${{ matrix.slug }}.tar.xz
           asset_content_type: application/octet-stream
       - name: upload (windows)
         if: github.event_name == 'release' && runner.os == 'Windows'
@@ -96,8 +97,8 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         with:
           upload_url: ${{ steps.get_release.outputs.upload_url }}
-          asset_path: rust/parpar-${{ env.TAG }}-rust-${{ matrix.slug }}.7z
-          asset_name: parpar-${{ env.TAG }}-rust-${{ matrix.slug }}.7z
+          asset_path: rust/parpar-${{ env.TAG }}-${{ matrix.slug }}.7z
+          asset_name: parpar-${{ env.TAG }}-${{ matrix.slug }}.7z
           asset_content_type: application/octet-stream
 
   checksums:
@@ -135,5 +136,5 @@ jobs:
         with:
           upload_url: ${{ steps.get_release.outputs.upload_url }}
           asset_path: SHA256SUMS.txt
-          asset_name: parpar-${{ env.TAG }}-rust-SHA256SUMS.txt
+          asset_name: parpar-${{ env.TAG }}-SHA256SUMS.txt
           asset_content_type: text/plain
