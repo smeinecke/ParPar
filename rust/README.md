@@ -110,3 +110,28 @@ Differential tests compare native and FFI output byte-for-byte; OpenCL
 tests run when a device is present and skip cleanly otherwise;
 `e2e_gen` compares against `node ../bin/parpar.js` when the JS addon
 is built (or the FFI binary via `PARPAR_FFI_BIN`), skipping otherwise.
+
+## Releasing
+
+Publishing a GitHub release runs `build-rust.yml`, which builds the
+binary for every matrix target and uploads it. Before tagging, verify
+the matrix compiles - the workflow's `workflow_dispatch` trigger does a
+dry-run build with no upload:
+
+```sh
+gh workflow run build-rust.yml
+gh run watch
+```
+
+or cross-check locally (same command CI uses, per target):
+
+```sh
+for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+         riscv64gc-unknown-linux-musl; do
+  cargo build --release --no-default-features --target "$t" -p parpar
+done
+```
+
+Version bumps touch `rust/crates/parpar/Cargo.toml`, `package.json`
+(keeps the JS Creator-packet version identical) and the creator strings
+in `crates/parpar/tests/e2e_gen.rs` + `e2e_integration.rs`.
