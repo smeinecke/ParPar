@@ -7,7 +7,7 @@
 
 #![cfg(target_arch = "x86_64")]
 
-use crate::gf::gf16_mul;
+use crate::gf::gf16_mul2;
 use crate::kernel::GfKernel;
 use std::arch::x86_64::*;
 
@@ -18,6 +18,7 @@ const GROUP: usize = 64; // 32 words per bit-plane group
 
 /// Split a 64B group into hi/lo byte vectors - 4 xmm words: [h01 h23 l01 l23]
 /// where h01 = hi bytes of words 0..15, h23 = words 16..31, same for lo.
+#[inline]
 #[target_feature(enable = "sse2")]
 unsafe fn prep_group(src: *const u8) -> (__m128i, __m128i, __m128i, __m128i) {
     let mask = _mm_set1_epi16(0x00ff);
@@ -33,6 +34,7 @@ unsafe fn prep_group(src: *const u8) -> (__m128i, __m128i, __m128i, __m128i) {
 }
 
 /// movemask + double: write 8 bit-planes of the (a,b) pair to `dst` u32 j.
+#[inline]
 #[target_feature(enable = "sse2")]
 unsafe fn prep_write(dst: *mut u32, j: usize, mut a: __m128i, mut b: __m128i) {
     for i in 0..8 {
@@ -43,6 +45,7 @@ unsafe fn prep_write(dst: *mut u32, j: usize, mut a: __m128i, mut b: __m128i) {
     }
 }
 
+#[inline]
 #[target_feature(enable = "sse2")]
 unsafe fn prepare_group(block: *mut u8, src: *const u8, j: usize) {
     let (h01, h23, l01, l23) = prep_group(src);
@@ -72,19 +75,22 @@ fn finish_group(dst: &mut [u8], src: &[u8], j: usize, words: usize) {
 
 /// deps[k] = bitmask of input bits contributing to output bit k for coeff.
 fn make_deps(coeff: u16) -> [u32; 16] {
+    // coeff*2^i = xtime^i(coeff) - a mul2 chain replaces bit-serial muls
     let mut deps = [0u32; 16];
+    let mut v = coeff;
     for i in 0..16 {
-        let v = gf16_mul(coeff, 1u16 << i);
         for k in 0..16 {
             if (v >> k) & 1 == 1 {
                 deps[k] |= 1 << i;
             }
         }
+        v = gf16_mul2(v);
     }
     deps
 }
 
 /// One 256B block: out row (15-k) = XOR of in rows (15-i) for i in deps[k].
+#[inline]
 #[target_feature(enable = "sse2")]
 unsafe fn mul_block(dst: *mut u8, src: *const u8, deps: &[u32; 16], add: bool) {
     let mut p = [_mm_setzero_si128(); 16];
@@ -107,6 +113,45 @@ unsafe fn mul_block(dst: *mut u8, src: *const u8, deps: &[u32; 16], add: bool) {
     }
 }
 
+// Per-call loops must be #[target_feature] fns (see shuffle_avx2).
+#[target_feature(enable = "sse2")]
+unsafe fn prepare_run(dst: &mut [u8], src: &[u8]) {
+    let mut blk = 0usize;
+    while blk < dst.len() {
+        let bdst = &mut dst[blk..blk + BLK];
+        for j in 0..4 {
+            let off = j * GROUP;
+            let have = src.len().saturating_sub(blk + off);
+            if have >= GROUP {
+                prepare_group(bdst.as_mut_ptr(), src.as_ptr().add(blk + off), j);
+            } else {
+                let mut tmp = [0u8; GROUP];
+                if have > 0 {
+                    tmp[..have].copy_from_slice(&src[blk + off..blk + off + have]);
+                    prepare_group(bdst.as_mut_ptr(), tmp.as_ptr(), j);
+                } else {
+                    for p in 0..16 {
+                        for b in bdst[p * 16 + j * 4..p * 16 + j * 4 + 4].iter_mut() {
+                            *b = 0;
+                        }
+                    }
+                }
+            }
+        }
+        blk += BLK;
+    }
+}
+
+#[target_feature(enable = "sse2")]
+unsafe fn muladd_run(dst: &mut [u8], src: &[u8], deps: &[u32; 16], add: bool) {
+    let mut i = 0;
+    while i + BLK <= src.len() {
+        mul_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i), deps, add);
+        i += BLK;
+    }
+    debug_assert_eq!(src.len() - i, 0, "mul region must be block-aligned");
+}
+
 impl GfKernel for XorSse {
     fn id(&self) -> i32 {
         crate::kernel::method::XOR_SSE
@@ -125,30 +170,7 @@ impl GfKernel for XorSse {
     }
 
     fn prepare(&self, dst: &mut [u8], src: &[u8]) {
-        let mut blk = 0usize;
-        while blk < dst.len() {
-            let bdst = &mut dst[blk..blk + BLK];
-            for j in 0..4 {
-                let off = j * GROUP;
-                let have = src.len().saturating_sub(blk + off);
-                if have >= GROUP {
-                    unsafe { prepare_group(bdst.as_mut_ptr(), src.as_ptr().add(blk + off), j) };
-                } else {
-                    let mut tmp = [0u8; GROUP];
-                    if have > 0 {
-                        tmp[..have].copy_from_slice(&src[blk + off..blk + off + have]);
-                        unsafe { prepare_group(bdst.as_mut_ptr(), tmp.as_ptr(), j) };
-                    } else {
-                        for p in 0..16 {
-                            for b in bdst[p * 16 + j * 4..p * 16 + j * 4 + 4].iter_mut() {
-                                *b = 0;
-                            }
-                        }
-                    }
-                }
-            }
-            blk += BLK;
-        }
+        unsafe { prepare_run(dst, src) }
     }
 
     fn finish(&self, dst: &mut [u8], src: &[u8]) {
@@ -172,14 +194,7 @@ impl GfKernel for XorSse {
             return;
         }
         let deps = make_deps(coeff);
-        unsafe {
-            let mut i = 0;
-            while i + BLK <= src.len() {
-                mul_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &deps, true);
-                i += BLK;
-            }
-            debug_assert_eq!(src.len() - i, 0, "muladd region must be block-aligned");
-        }
+        unsafe { muladd_run(dst, src, &deps, true) }
     }
 
     fn mul(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
@@ -190,14 +205,7 @@ impl GfKernel for XorSse {
             return;
         }
         let deps = make_deps(coeff);
-        unsafe {
-            let mut i = 0;
-            while i + BLK <= src.len() {
-                mul_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &deps, false);
-                i += BLK;
-            }
-            debug_assert_eq!(src.len() - i, 0, "mul region must be block-aligned");
-        }
+        unsafe { muladd_run(dst, src, &deps, false) }
     }
 }
 

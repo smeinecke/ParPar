@@ -4,7 +4,7 @@
 
 #![cfg(target_arch = "x86_64")]
 
-use crate::gf::gf16_mul;
+use crate::gf::{gf16_mul, gf16_mul2};
 use crate::kernel::GfKernel;
 use std::arch::x86_64::*;
 
@@ -19,13 +19,31 @@ struct Tables {
 
 #[target_feature(enable = "ssse3")]
 unsafe fn make_tables(coeff: u16) -> Tables {
-    let b = |k: u32| -> ([u8; 16], [u8; 16]) {
+    // table k entry x = coeff*(x<<4k) = c_k*x, c_k = coeff*2^(4k); c*x for
+    // 4-bit x is the XOR of xtime^j(c) over set bits j of x. Avoids the
+    // bit-serial gf16_mul loop per entry.
+    let b = |c: u16| -> ([u8; 16], [u8; 16]) {
+        let d1 = gf16_mul2(c);
+        let d2 = gf16_mul2(d1);
+        let d3 = gf16_mul2(d2);
         let mut lo = [0u8; 16];
         let mut hi = [0u8; 16];
-        for x in 0..16usize {
-            let t = gf16_mul(coeff, (x as u16) << k);
-            lo[x] = t as u8;
-            hi[x] = (t >> 8) as u8;
+        for x in 1..16usize {
+            let mut p = 0u16;
+            if x & 1 != 0 {
+                p ^= c;
+            }
+            if x & 2 != 0 {
+                p ^= d1;
+            }
+            if x & 4 != 0 {
+                p ^= d2;
+            }
+            if x & 8 != 0 {
+                p ^= d3;
+            }
+            lo[x] = p as u8;
+            hi[x] = (p >> 8) as u8;
         }
         (lo, hi)
     };
@@ -35,16 +53,20 @@ unsafe fn make_tables(coeff: u16) -> Tables {
             _mm_loadu_si128(pair.1.as_ptr() as _),
         )
     };
-    let (l0, h0) = v(b(0));
-    let (l1, h1) = v(b(4));
-    let (l2, h2) = v(b(8));
-    let (l3, h3) = v(b(12));
+    let c1 = gf16_mul2(gf16_mul2(gf16_mul2(gf16_mul2(coeff))));
+    let c2 = gf16_mul2(gf16_mul2(gf16_mul2(gf16_mul2(c1))));
+    let c3 = gf16_mul2(gf16_mul2(gf16_mul2(gf16_mul2(c2))));
+    let (l0, h0) = v(b(coeff));
+    let (l1, h1) = v(b(c1));
+    let (l2, h2) = v(b(c2));
+    let (l3, h3) = v(b(c3));
     Tables {
         lo: [l0, l1, l2, l3],
         hi: [h0, h1, h2, h3],
     }
 }
 
+#[inline]
 #[target_feature(enable = "ssse3")]
 pub(crate) unsafe fn prepare_block(dst: *mut u8, src: *const u8) {
     let mask = _mm_set1_epi16(0x00ff);
@@ -56,6 +78,7 @@ pub(crate) unsafe fn prepare_block(dst: *mut u8, src: *const u8) {
     _mm_storeu_si128(dst.add(16) as _, lo);
 }
 
+#[inline]
 #[target_feature(enable = "ssse3")]
 pub(crate) unsafe fn finish_block(dst: *mut u8, src: *const u8) {
     let hi = _mm_loadu_si128(src as _);
@@ -64,6 +87,7 @@ pub(crate) unsafe fn finish_block(dst: *mut u8, src: *const u8) {
     _mm_storeu_si128(dst.add(16) as _, _mm_unpackhi_epi8(lo, hi));
 }
 
+#[inline]
 #[target_feature(enable = "ssse3")]
 unsafe fn muladd_block(dst: *mut u8, src: *const u8, t: &Tables, add: bool) {
     let nmask = _mm_set1_epi8(0x0f);
@@ -144,6 +168,48 @@ pub(crate) fn muladd_scalar(dst: &mut [u8], src: &[u8], coeff: u16, add: bool) {
     }
 }
 
+// Per-call loops must be #[target_feature] fns (see shuffle_avx2).
+#[target_feature(enable = "ssse3")]
+unsafe fn prepare_run(dst: &mut [u8], src: &[u8]) {
+    let mut i = 0;
+    while i + BLK <= src.len() {
+        prepare_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
+        i += BLK;
+    }
+    if i < src.len() {
+        prepare_scalar(&mut dst[i..], &src[i..]);
+    } else {
+        for b in dst[i..].iter_mut() {
+            *b = 0;
+        }
+    }
+}
+
+#[target_feature(enable = "ssse3")]
+unsafe fn finish_run(dst: &mut [u8], src: &[u8]) {
+    let mut i = 0;
+    while i + BLK <= dst.len() {
+        finish_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
+        i += BLK;
+    }
+    if i < dst.len() {
+        finish_scalar(&mut dst[i..], &src[i..]);
+    }
+}
+
+#[target_feature(enable = "ssse3")]
+unsafe fn muladd_run(dst: &mut [u8], src: &[u8], coeff: u16, add: bool) {
+    let t = make_tables(coeff);
+    let mut i = 0;
+    while i + BLK <= src.len() {
+        muladd_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &t, add);
+        i += BLK;
+    }
+    if i < src.len() {
+        muladd_scalar(&mut dst[i..], &src[i..], coeff, add);
+    }
+}
+
 impl GfKernel for ShuffleSse {
     fn id(&self) -> i32 {
         crate::kernel::method::SHUFFLE_SSE
@@ -162,60 +228,18 @@ impl GfKernel for ShuffleSse {
     }
 
     fn prepare(&self, dst: &mut [u8], src: &[u8]) {
-        let mut i = 0;
-        unsafe {
-            while i + BLK <= src.len() {
-                prepare_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
-                i += BLK;
-            }
-        }
-        if i < src.len() {
-            prepare_scalar(&mut dst[i..], &src[i..]);
-        } else {
-            for b in dst[i..].iter_mut() {
-                *b = 0;
-            }
-        }
+        unsafe { prepare_run(dst, src) }
     }
 
     fn finish(&self, dst: &mut [u8], src: &[u8]) {
-        let mut i = 0;
-        unsafe {
-            while i + BLK <= dst.len() {
-                finish_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
-                i += BLK;
-            }
-        }
-        if i < dst.len() {
-            finish_scalar(&mut dst[i..], &src[i..]);
-        }
+        unsafe { finish_run(dst, src) }
     }
 
     fn muladd(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
-        unsafe {
-            let t = make_tables(coeff);
-            let mut i = 0;
-            while i + BLK <= src.len() {
-                muladd_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &t, true);
-                i += BLK;
-            }
-            if i < src.len() {
-                muladd_scalar(&mut dst[i..], &src[i..], coeff, true);
-            }
-        }
+        unsafe { muladd_run(dst, src, coeff, true) }
     }
 
     fn mul(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
-        unsafe {
-            let t = make_tables(coeff);
-            let mut i = 0;
-            while i + BLK <= src.len() {
-                muladd_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &t, false);
-                i += BLK;
-            }
-            if i < src.len() {
-                muladd_scalar(&mut dst[i..], &src[i..], coeff, false);
-            }
-        }
+        unsafe { muladd_run(dst, src, coeff, false) }
     }
 }

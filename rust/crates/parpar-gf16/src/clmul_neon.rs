@@ -45,6 +45,7 @@ unsafe fn eor3q_u8(a: uint8x16_t, b: uint8x16_t, c: uint8x16_t) -> uint8x16_t {
 /// Per-coefficient broadcast vectors: [c_lo, c_hi, c_lo^c_hi].
 pub(crate) struct Coeffs([poly8x16_t; 3]);
 
+#[inline]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn make_coeffs(val: u16) -> Coeffs {
     let lo = vdupq_n_p8((val & 0xff) as u8);
@@ -52,6 +53,7 @@ pub(crate) unsafe fn make_coeffs(val: u16) -> Coeffs {
     Coeffs([lo, hi, veorq_p8(lo, hi)])
 }
 
+#[inline]
 #[target_feature(enable = "aes")]
 unsafe fn reduction(
     low1: &mut poly16x8_t,
@@ -110,6 +112,7 @@ unsafe fn reduction(
     *high2 = vreinterpretq_p16_u8(lob1);
 }
 
+#[inline]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn muladd_block(dst: *mut u8, src: *const u8, c: &Coeffs, add: bool) {
     let data = vld2q_p8(src); // data.0 = lo bytes, data.1 = hi bytes
@@ -155,6 +158,20 @@ pub(crate) fn muladd_scalar(dst: &mut [u8], src: &[u8], coeff: u16, add: bool) {
     }
 }
 
+// Per-call loops must be #[target_feature] fns (see shuffle_avx2).
+#[target_feature(enable = "aes")]
+unsafe fn muladd_run(dst: &mut [u8], src: &[u8], coeff: u16, add: bool) {
+    let c = make_coeffs(coeff);
+    let mut i = 0;
+    while i + BLK <= src.len() {
+        muladd_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &c, add);
+        i += BLK;
+    }
+    if i < src.len() {
+        muladd_scalar(&mut dst[i..], &src[i..], coeff, add);
+    }
+}
+
 impl GfKernel for ClmulNeon {
     fn id(&self) -> i32 {
         28 // GF16_CLMUL_NEON
@@ -185,31 +202,11 @@ impl GfKernel for ClmulNeon {
     }
 
     fn muladd(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
-        unsafe {
-            let c = make_coeffs(coeff);
-            let mut i = 0;
-            while i + BLK <= src.len() {
-                muladd_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &c, true);
-                i += BLK;
-            }
-            if i < src.len() {
-                muladd_scalar(&mut dst[i..], &src[i..], coeff, true);
-            }
-        }
+        unsafe { muladd_run(dst, src, coeff, true) }
     }
 
     fn mul(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
-        unsafe {
-            let c = make_coeffs(coeff);
-            let mut i = 0;
-            while i + BLK <= src.len() {
-                muladd_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &c, false);
-                i += BLK;
-            }
-            if i < src.len() {
-                muladd_scalar(&mut dst[i..], &src[i..], coeff, false);
-            }
-        }
+        unsafe { muladd_run(dst, src, coeff, false) }
     }
 }
 
@@ -247,31 +244,11 @@ impl GfKernel for ClmulSha3 {
     }
 
     fn muladd(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
-        unsafe {
-            let c = make_coeffs(coeff);
-            let mut i = 0;
-            while i + BLK <= src.len() {
-                muladd_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &c, true);
-                i += BLK;
-            }
-            if i < src.len() {
-                muladd_scalar(&mut dst[i..], &src[i..], coeff, true);
-            }
-        }
+        unsafe { muladd_run(dst, src, coeff, true) }
     }
 
     fn mul(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
-        unsafe {
-            let c = make_coeffs(coeff);
-            let mut i = 0;
-            while i + BLK <= src.len() {
-                muladd_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &c, false);
-                i += BLK;
-            }
-            if i < src.len() {
-                muladd_scalar(&mut dst[i..], &src[i..], coeff, false);
-            }
-        }
+        unsafe { muladd_run(dst, src, coeff, false) }
     }
 }
 

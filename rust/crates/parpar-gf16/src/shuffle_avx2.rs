@@ -20,40 +20,149 @@ pub struct ShuffleAvx2;
 
 const BLK: usize = 64; // packed block: 32 u16 words
 
+// The per-call loops must be #[target_feature] fns themselves: a feature
+// fn cannot inline into a plain caller, so looping over blocks from the
+// trait methods would cost a call plus 8 table reloads per 64 bytes.
+#[target_feature(enable = "avx2")]
+unsafe fn prepare_run(dst: &mut [u8], src: &[u8]) {
+    let mut i = 0;
+    while i + BLK <= src.len() {
+        prepare_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
+        i += BLK;
+    }
+    if i < src.len() {
+        prepare_scalar(&mut dst[i..], &src[i..]);
+    } else {
+        for b in dst[i..].iter_mut() {
+            *b = 0;
+        }
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn finish_run(dst: &mut [u8], src: &[u8]) {
+    let mut i = 0;
+    while i + BLK <= dst.len() {
+        finish_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
+        i += BLK;
+    }
+    if i < dst.len() {
+        finish_scalar(&mut dst[i..], &src[i..]);
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn muladd_run(dst: &mut [u8], src: &[u8], coeff: u16, add: bool) {
+    let t = make_tables(coeff);
+    let nblocks = src.len() / BLK;
+    for b in 0..nblocks {
+        muladd_block(
+            dst.as_mut_ptr().add(b * BLK),
+            src.as_ptr().add(b * BLK),
+            &t,
+            add,
+        );
+    }
+    let i = nblocks * BLK;
+    if i < src.len() {
+        muladd_scalar(&mut dst[i..], &src[i..], coeff, add);
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn muladd2_run(
+    dst: &mut [u8],
+    src_a: &[u8],
+    coeff_a: u16,
+    src_b: &[u8],
+    coeff_b: u16,
+) {
+    let n = src_a.len().min(src_b.len());
+    let ta = make_tables(coeff_a);
+    let tb = make_tables(coeff_b);
+    let mut i = 0;
+    // 4x unroll: independent block chains give the OoO engine
+    // parallel pshufb pipelines instead of a serial block stream
+    while i + 4 * BLK <= n {
+        for u in 0..4 {
+            muladd2_block(
+                dst.as_mut_ptr().add(i + u * BLK),
+                src_a.as_ptr().add(i + u * BLK),
+                &ta,
+                src_b.as_ptr().add(i + u * BLK),
+                &tb,
+            );
+        }
+        i += 4 * BLK;
+    }
+    while i + BLK <= n {
+        muladd2_block(
+            dst.as_mut_ptr().add(i),
+            src_a.as_ptr().add(i),
+            &ta,
+            src_b.as_ptr().add(i),
+            &tb,
+        );
+        i += BLK;
+    }
+    if i < n {
+        muladd_scalar(&mut dst[i..], &src_a[i..n], coeff_a, true);
+        muladd_scalar(&mut dst[i..], &src_b[i..n], coeff_b, true);
+    }
+}
+
 /// Eight 16-entry pshufb tables for a coefficient (low/high byte planes x4).
 struct Tables {
     lo: [__m256i; 4],
     hi: [__m256i; 4],
 }
 
+#[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn make_tables(coeff: u16) -> Tables {
-    let b = |k: u32| -> ([u8; 16], [u8; 16]) {
-        let mut lo = [0u8; 16];
-        let mut hi = [0u8; 16];
-        for x in 0..16usize {
-            let t = gf16_mul(coeff, (x as u16) << k);
-            lo[x] = t as u8;
-            hi[x] = (t >> 8) as u8;
-        }
-        (lo, hi)
-    };
-    let v = |pair: ([u8; 16], [u8; 16])| -> (__m256i, __m256i) {
-        (
-            _mm256_broadcastsi128_si256(_mm_loadu_si128(pair.0.as_ptr() as _)),
-            _mm256_broadcastsi128_si256(_mm_loadu_si128(pair.1.as_ptr() as _)),
+    // table k entry x = coeff*(x<<4k) = c_k*x, c_k = coeff*2^(4k). All 16
+    // entries are built at once in u16 lanes: c*x for a 4-bit x is the XOR
+    // of xtime^j(c) over set bits j of x. ~30 SIMD ops/table vs 16 scalar
+    // bit-serial gf16_mul calls.
+    let poly = _mm256_set1_epi16(0x100b);
+    let xt = |v: __m256i| -> __m256i {
+        _mm256_xor_si256(
+            _mm256_add_epi16(v, v),
+            _mm256_and_si256(_mm256_srai_epi16::<15>(v), poly),
         )
     };
-    let (l0, h0) = v(b(0));
-    let (l1, h1) = v(b(4));
-    let (l2, h2) = v(b(8));
-    let (l3, h3) = v(b(12));
-    Tables {
-        lo: [l0, l1, l2, l3],
-        hi: [h0, h1, h2, h3],
+    let xv = _mm256_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let m = [
+        _mm256_srai_epi16::<15>(_mm256_slli_epi16::<15>(xv)),
+        _mm256_srai_epi16::<15>(_mm256_slli_epi16::<14>(xv)),
+        _mm256_srai_epi16::<15>(_mm256_slli_epi16::<13>(xv)),
+        _mm256_srai_epi16::<15>(_mm256_slli_epi16::<12>(xv)),
+    ];
+    let ff = _mm256_set1_epi16(0xff);
+    let mut lo = [_mm256_setzero_si256(); 4];
+    let mut hi = [_mm256_setzero_si256(); 4];
+    let mut c = _mm256_set1_epi16(coeff as i16);
+    for k in 0..4 {
+        let d1 = xt(c);
+        let d2 = xt(d1);
+        let d3 = xt(d2);
+        let p = _mm256_xor_si256(
+            _mm256_xor_si256(_mm256_and_si256(c, m[0]), _mm256_and_si256(d1, m[1])),
+            _mm256_xor_si256(_mm256_and_si256(d2, m[2]), _mm256_and_si256(d3, m[3])),
+        );
+        // pack u16 lanes -> 16 lo/hi bytes, duplicated across lanes by
+        // packus; permq(0xd8) gathers qwords 0,2 into both halves
+        let l8 = _mm256_packus_epi16(_mm256_and_si256(p, ff), _mm256_and_si256(p, ff));
+        let h8 = _mm256_srli_epi16::<8>(p);
+        let h8 = _mm256_packus_epi16(h8, h8);
+        lo[k] = _mm256_permute4x64_epi64(l8, 0b11011000);
+        hi[k] = _mm256_permute4x64_epi64(h8, 0b11011000);
+        c = xt(xt(xt(xt(c))));
     }
+    Tables { lo, hi }
 }
 
+#[inline]
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn prepare_block(dst: *mut u8, src: *const u8) {
     let mask = _mm256_set1_epi16(0x00ff);
@@ -68,6 +177,7 @@ pub(crate) unsafe fn prepare_block(dst: *mut u8, src: *const u8) {
     _mm256_storeu_si256(dst.add(32) as _, lo);
 }
 
+#[inline]
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn finish_block(dst: *mut u8, src: *const u8) {
     let hi = _mm256_loadu_si256(src as _);
@@ -79,15 +189,19 @@ pub(crate) unsafe fn finish_block(dst: *mut u8, src: *const u8) {
 }
 
 /// c*src for one packed block, as (lo-plane, hi-plane) vectors.
+#[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn mul_plane(src: *const u8, t: &Tables) -> (__m256i, __m256i) {
     let nmask = _mm256_set1_epi8(0x0f);
-    let hi = _mm256_loadu_si256(src as _);
-    let lo = _mm256_loadu_si256(src.add(32) as _);
-    let hn = _mm256_and_si256(hi, nmask);
-    let hnh = _mm256_and_si256(_mm256_srli_epi16(hi, 4), nmask);
-    let ln = _mm256_and_si256(lo, nmask);
-    let lnh = _mm256_and_si256(_mm256_srli_epi16(lo, 4), nmask);
+    // C++ structure: each plane is loaded twice so the low-nibble extract
+    // folds its load into vpand (mem) - trades load-port uops for FP-port
+    // ands, and the FP ports are the saturated resource here.
+    let hi_v = _mm256_loadu_si256(src as _);
+    let lo_v = _mm256_loadu_si256(src.add(32) as _);
+    let hn = _mm256_and_si256(_mm256_loadu_si256(src as _), nmask);
+    let ln = _mm256_and_si256(_mm256_loadu_si256(src.add(32) as _), nmask);
+    let hnh = _mm256_and_si256(_mm256_srli_epi16(hi_v, 4), nmask);
+    let lnh = _mm256_and_si256(_mm256_srli_epi16(lo_v, 4), nmask);
     let mut tpl = _mm256_shuffle_epi8(t.lo[0], ln);
     let mut tph = _mm256_shuffle_epi8(t.hi[0], ln);
     tpl = _mm256_xor_si256(tpl, _mm256_shuffle_epi8(t.lo[1], lnh));
@@ -99,6 +213,7 @@ unsafe fn mul_plane(src: *const u8, t: &Tables) -> (__m256i, __m256i) {
     (tpl, tph)
 }
 
+#[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn muladd_block(dst: *mut u8, src: *const u8, t: &Tables, add: bool) {
     let (mut tpl, mut tph) = mul_plane(src, t);
@@ -112,6 +227,7 @@ unsafe fn muladd_block(dst: *mut u8, src: *const u8, t: &Tables, add: bool) {
 
 /// dst ^= ca*sa ^ cb*sb for one packed block - both products accumulate
 /// into a single dst load/store (C++ procRegions=2 fused pass).
+#[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn muladd2_block(
     dst: *mut u8,
@@ -200,85 +316,20 @@ impl GfKernel for ShuffleAvx2 {
     }
 
     fn prepare(&self, dst: &mut [u8], src: &[u8]) {
-        let mut i = 0;
-        unsafe {
-            while i + BLK <= src.len() {
-                prepare_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
-                i += BLK;
-            }
-        }
-        if i < src.len() {
-            // scalar tail also zero-pads the remainder of dst
-            prepare_scalar(&mut dst[i..], &src[i..]);
-        } else {
-            for b in dst[i..].iter_mut() {
-                *b = 0;
-            }
-        }
+        unsafe { prepare_run(dst, src) }
     }
 
     fn finish(&self, dst: &mut [u8], src: &[u8]) {
-        let mut i = 0;
-        unsafe {
-            while i + BLK <= dst.len() {
-                finish_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
-                i += BLK;
-            }
-        }
-        if i < dst.len() {
-            finish_scalar(&mut dst[i..], &src[i..]);
-        }
+        unsafe { finish_run(dst, src) }
     }
 
     fn muladd(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
-        unsafe {
-            let t = make_tables(coeff);
-            let mut i = 0;
-            while i + BLK <= src.len() {
-                muladd_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &t, true);
-                i += BLK;
-            }
-            if i < src.len() {
-                muladd_scalar(&mut dst[i..], &src[i..], coeff, true);
-            }
-        }
+        unsafe { muladd_run(dst, src, coeff, true) }
     }
 
     fn muladd2(&self, dst: &mut [u8], src_a: &[u8], coeff_a: u16, src_b: &[u8], coeff_b: u16) {
         let n = src_a.len().min(src_b.len());
-        unsafe {
-            let ta = make_tables(coeff_a);
-            let tb = make_tables(coeff_b);
-            let mut i = 0;
-            // 4x unroll: independent block chains give the OoO engine
-            // parallel pshufb pipelines instead of a serial block stream
-            while i + 4 * BLK <= n {
-                for u in 0..4 {
-                    muladd2_block(
-                        dst.as_mut_ptr().add(i + u * BLK),
-                        src_a.as_ptr().add(i + u * BLK),
-                        &ta,
-                        src_b.as_ptr().add(i + u * BLK),
-                        &tb,
-                    );
-                }
-                i += 4 * BLK;
-            }
-            while i + BLK <= n {
-                muladd2_block(
-                    dst.as_mut_ptr().add(i),
-                    src_a.as_ptr().add(i),
-                    &ta,
-                    src_b.as_ptr().add(i),
-                    &tb,
-                );
-                i += BLK;
-            }
-            if i < n {
-                muladd_scalar(&mut dst[i..], &src_a[i..n], coeff_a, true);
-                muladd_scalar(&mut dst[i..], &src_b[i..n], coeff_b, true);
-            }
-        }
+        unsafe { muladd2_run(&mut dst[..n], &src_a[..n], coeff_a, &src_b[..n], coeff_b) }
         // a staged input can be shorter than its partner (slice size grew
         // after staging) - the longer tail still contributes
         if src_a.len() > n {
@@ -290,16 +341,6 @@ impl GfKernel for ShuffleAvx2 {
     }
 
     fn mul(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
-        unsafe {
-            let t = make_tables(coeff);
-            let mut i = 0;
-            while i + BLK <= src.len() {
-                muladd_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &t, false);
-                i += BLK;
-            }
-            if i < src.len() {
-                muladd_scalar(&mut dst[i..], &src[i..], coeff, false);
-            }
-        }
+        unsafe { muladd_run(dst, src, coeff, false) }
     }
 }

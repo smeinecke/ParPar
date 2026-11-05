@@ -14,7 +14,7 @@
 
 #![cfg(target_arch = "x86_64")]
 
-use crate::gf::gf16_mul;
+use crate::gf::{gf16_mul, gf16_mul2};
 use crate::kernel::GfKernel;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -35,11 +35,20 @@ fn mat_of(f: impl Fn(u8) -> u8) -> u64 {
 }
 
 fn mats(coeff: u16) -> (u64, u64, u64, u64) {
-    let lo = |x: u8| gf16_mul(coeff, x as u16) as u8;
-    let hi = |x: u8| (gf16_mul(coeff, x as u16) >> 8) as u8;
-    let blo = |x: u8| gf16_mul(coeff, (x as u16) << 8) as u8;
-    let bhi = |x: u8| (gf16_mul(coeff, (x as u16) << 8) >> 8) as u8;
-    (mat_of(lo), mat_of(hi), mat_of(blo), mat_of(bhi))
+    // the matrices only sample powers of 2: c_j = coeff*2^j for j in
+    // 0..16 via an xtime chain replaces the bit-serial gf16_mul calls.
+    let mut c = [0u16; 16];
+    c[0] = coeff;
+    for j in 1..16 {
+        c[j] = gf16_mul2(c[j - 1]);
+    }
+    let bit = |x: u8| x.trailing_zeros() as usize;
+    (
+        mat_of(|x| c[bit(x)] as u8),
+        mat_of(|x| (c[bit(x)] >> 8) as u8),
+        mat_of(|x| c[8 + bit(x)] as u8),
+        mat_of(|x| (c[8 + bit(x)] >> 8) as u8),
+    )
 }
 
 // ---------- 1x kernels: [hi][lo] planes ----------
@@ -96,6 +105,7 @@ macro_rules! affine1x {
             const BLK: usize = $blk;
             const PLANE: usize = $plane;
 
+            #[inline]
             #[target_feature(enable = $feat)]
             unsafe fn muladd_b(dst: *mut u8, src: *const u8, m: &(u64, u64, u64, u64), add: bool) {
                 let (m_ll, m_hl, m_lh, m_hh) = *m;
@@ -117,6 +127,48 @@ macro_rules! affine1x {
                 $store(dst.add(PLANE) as _, tpl);
             }
 
+            // Per-call loops must be #[target_feature] fns (see shuffle_avx2).
+            #[target_feature(enable = $feat)]
+            unsafe fn prepare_run(dst: &mut [u8], src: &[u8]) {
+                let mut i = 0;
+                while i + BLK <= src.len() {
+                    crate::$modp::prepare_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
+                    i += BLK;
+                }
+                if i < src.len() {
+                    prepare_scalar_1x(&mut dst[i..], &src[i..], PLANE);
+                } else {
+                    for b in dst[i..].iter_mut() {
+                        *b = 0;
+                    }
+                }
+            }
+
+            #[target_feature(enable = $feat)]
+            unsafe fn finish_run(dst: &mut [u8], src: &[u8]) {
+                let mut i = 0;
+                while i + BLK <= dst.len() {
+                    crate::$modp::finish_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
+                    i += BLK;
+                }
+                if i < dst.len() {
+                    finish_scalar_1x(&mut dst[i..], &src[i..], PLANE);
+                }
+            }
+
+            #[target_feature(enable = $feat)]
+            unsafe fn muladd_run(dst: &mut [u8], src: &[u8], coeff: u16, add: bool) {
+                let m = mats(coeff);
+                let mut i = 0;
+                while i + BLK <= src.len() {
+                    muladd_b(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &m, add);
+                    i += BLK;
+                }
+                if i < src.len() {
+                    muladd_scalar_1x(&mut dst[i..], &src[i..], coeff, add, PLANE);
+                }
+            }
+
             impl GfKernel for $name {
                 fn id(&self) -> i32 {
                     $id
@@ -135,67 +187,19 @@ macro_rules! affine1x {
                 }
 
                 fn prepare(&self, dst: &mut [u8], src: &[u8]) {
-                    let mut i = 0;
-                    unsafe {
-                        while i + BLK <= src.len() {
-                            crate::$modp::prepare_block(
-                                dst.as_mut_ptr().add(i),
-                                src.as_ptr().add(i),
-                            );
-                            i += BLK;
-                        }
-                    }
-                    if i < src.len() {
-                        prepare_scalar_1x(&mut dst[i..], &src[i..], PLANE);
-                    } else {
-                        for b in dst[i..].iter_mut() {
-                            *b = 0;
-                        }
-                    }
+                    unsafe { prepare_run(dst, src) }
                 }
 
                 fn finish(&self, dst: &mut [u8], src: &[u8]) {
-                    let mut i = 0;
-                    unsafe {
-                        while i + BLK <= dst.len() {
-                            crate::$modp::finish_block(
-                                dst.as_mut_ptr().add(i),
-                                src.as_ptr().add(i),
-                            );
-                            i += BLK;
-                        }
-                    }
-                    if i < dst.len() {
-                        finish_scalar_1x(&mut dst[i..], &src[i..], PLANE);
-                    }
+                    unsafe { finish_run(dst, src) }
                 }
 
                 fn muladd(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
-                    let m = mats(coeff);
-                    unsafe {
-                        let mut i = 0;
-                        while i + BLK <= src.len() {
-                            muladd_b(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &m, true);
-                            i += BLK;
-                        }
-                        if i < src.len() {
-                            muladd_scalar_1x(&mut dst[i..], &src[i..], coeff, true, PLANE);
-                        }
-                    }
+                    unsafe { muladd_run(dst, src, coeff, true) }
                 }
 
                 fn mul(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
-                    let m = mats(coeff);
-                    unsafe {
-                        let mut i = 0;
-                        while i + BLK <= src.len() {
-                            muladd_b(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &m, false);
-                            i += BLK;
-                        }
-                        if i < src.len() {
-                            muladd_scalar_1x(&mut dst[i..], &src[i..], coeff, false, PLANE);
-                        }
-                    }
+                    unsafe { muladd_run(dst, src, coeff, false) }
                 }
             }
         }
@@ -333,6 +337,7 @@ macro_rules! affine2x {
             pub struct $name;
             const BLK: usize = $blk;
 
+            #[inline]
             #[target_feature(enable = $feat)]
             unsafe fn prepare_b(dst: *mut u8, src: *const u8) {
                 let v = $load(src as _);
@@ -342,6 +347,7 @@ macro_rules! affine2x {
                 $store(dst as _, $shuf8(v, idx));
             }
 
+            #[inline]
             #[target_feature(enable = $feat)]
             unsafe fn finish_b(dst: *mut u8, src: *const u8) {
                 let v = $load(src as _);
@@ -360,6 +366,7 @@ macro_rules! affine2x {
                 $store(dst as _, $shuf8(v, idx));
             }
 
+            #[inline]
             #[target_feature(enable = $feat)]
             unsafe fn muladd_b(dst: *mut u8, src: *const u8, m: &(u64, u64, u64, u64), add: bool) {
                 let (m_ll, m_hl, m_lh, m_hh) = *m;
@@ -375,6 +382,48 @@ macro_rules! affine2x {
                     res = $xor(res, $load(dst as _));
                 }
                 $store(dst as _, res);
+            }
+
+            // Per-call loops must be #[target_feature] fns (see shuffle_avx2).
+            #[target_feature(enable = $feat)]
+            unsafe fn prepare_run(dst: &mut [u8], src: &[u8]) {
+                let mut i = 0;
+                while i + BLK <= src.len() {
+                    prepare_b(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
+                    i += BLK;
+                }
+                if i < src.len() {
+                    prepare_scalar_2x(&mut dst[i..], &src[i..]);
+                } else {
+                    for b in dst[i..].iter_mut() {
+                        *b = 0;
+                    }
+                }
+            }
+
+            #[target_feature(enable = $feat)]
+            unsafe fn finish_run(dst: &mut [u8], src: &[u8]) {
+                let mut i = 0;
+                while i + BLK <= dst.len() {
+                    finish_b(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
+                    i += BLK;
+                }
+                if i < dst.len() {
+                    finish_scalar_2x(&mut dst[i..], &src[i..]);
+                }
+            }
+
+            #[target_feature(enable = $feat)]
+            unsafe fn muladd_run(dst: &mut [u8], src: &[u8], coeff: u16, add: bool) {
+                let m = mats(coeff);
+                let mut i = 0;
+                while i + BLK <= src.len() {
+                    muladd_b(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &m, add);
+                    i += BLK;
+                }
+                if i < src.len() {
+                    muladd_scalar_2x(&mut dst[i..], &src[i..], coeff, add);
+                }
             }
 
             impl GfKernel for $name {
@@ -395,61 +444,19 @@ macro_rules! affine2x {
                 }
 
                 fn prepare(&self, dst: &mut [u8], src: &[u8]) {
-                    let mut i = 0;
-                    unsafe {
-                        while i + BLK <= src.len() {
-                            prepare_b(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
-                            i += BLK;
-                        }
-                    }
-                    if i < src.len() {
-                        prepare_scalar_2x(&mut dst[i..], &src[i..]);
-                    } else {
-                        for b in dst[i..].iter_mut() {
-                            *b = 0;
-                        }
-                    }
+                    unsafe { prepare_run(dst, src) }
                 }
 
                 fn finish(&self, dst: &mut [u8], src: &[u8]) {
-                    let mut i = 0;
-                    unsafe {
-                        while i + BLK <= dst.len() {
-                            finish_b(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
-                            i += BLK;
-                        }
-                    }
-                    if i < dst.len() {
-                        finish_scalar_2x(&mut dst[i..], &src[i..]);
-                    }
+                    unsafe { finish_run(dst, src) }
                 }
 
                 fn muladd(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
-                    let m = mats(coeff);
-                    unsafe {
-                        let mut i = 0;
-                        while i + BLK <= src.len() {
-                            muladd_b(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &m, true);
-                            i += BLK;
-                        }
-                        if i < src.len() {
-                            muladd_scalar_2x(&mut dst[i..], &src[i..], coeff, true);
-                        }
-                    }
+                    unsafe { muladd_run(dst, src, coeff, true) }
                 }
 
                 fn mul(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
-                    let m = mats(coeff);
-                    unsafe {
-                        let mut i = 0;
-                        while i + BLK <= src.len() {
-                            muladd_b(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &m, false);
-                            i += BLK;
-                        }
-                        if i < src.len() {
-                            muladd_scalar_2x(&mut dst[i..], &src[i..], coeff, false);
-                        }
-                    }
+                    unsafe { muladd_run(dst, src, coeff, false) }
                 }
             }
         }

@@ -10,7 +10,7 @@
 
 #![cfg(target_arch = "aarch64")]
 
-use crate::gf::gf16_mul;
+use crate::gf::{gf16_mul, gf16_mul2};
 use crate::kernel::GfKernel;
 use std::arch::aarch64::*;
 
@@ -25,20 +25,44 @@ struct Tables {
 }
 
 unsafe fn make_tables(coeff: u16) -> Tables {
-    let t = |k: u32| -> (uint8x16_t, uint8x16_t) {
+    // table k entry x = coeff*(x<<4k) = c_k*x, c_k = coeff*2^(4k); c*x
+    // for 4-bit x is the XOR of xtime^j(c) over set bits j of x. Avoids
+    // the bit-serial gf16_mul loop per entry.
+    let t = |c: u16| -> (uint8x16_t, uint8x16_t) {
+        let d1 = gf16_mul2(c);
+        let d2 = gf16_mul2(d1);
+        let d3 = gf16_mul2(d2);
         let mut lo = [0u8; 16];
         let mut hi = [0u8; 16];
-        for x in 0..16usize {
-            let p = gf16_mul(coeff, (x as u16) << k);
+        for x in 1..16usize {
+            let mut p = 0u16;
+            if x & 1 != 0 {
+                p ^= c;
+            }
+            if x & 2 != 0 {
+                p ^= d1;
+            }
+            if x & 4 != 0 {
+                p ^= d2;
+            }
+            if x & 8 != 0 {
+                p ^= d3;
+            }
             lo[x] = p as u8;
             hi[x] = (p >> 8) as u8;
         }
         (vld1q_u8(lo.as_ptr()), vld1q_u8(hi.as_ptr()))
     };
-    let (l0, h0) = t(0);
-    let (l1, h1) = t(4);
-    let (l2, h2) = t(8);
-    let (l3, h3) = t(12);
+    let x4 = |mut v: u16| {
+        for _ in 0..4 {
+            v = gf16_mul2(v);
+        }
+        v
+    };
+    let (l0, h0) = t(coeff);
+    let (l1, h1) = t(x4(coeff));
+    let (l2, h2) = t(x4(x4(coeff)));
+    let (l3, h3) = t(x4(x4(x4(coeff))));
     Tables {
         l: [l0, l1, l2, l3],
         h: [h0, h1, h2, h3],

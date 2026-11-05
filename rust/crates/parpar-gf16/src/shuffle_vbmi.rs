@@ -10,7 +10,7 @@
 
 #![cfg(target_arch = "x86_64")]
 
-use crate::gf::gf16_mul;
+use crate::gf::gf16_mul2;
 use crate::kernel::GfKernel;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -25,21 +25,41 @@ struct Tables {
     hi: [__m512i; 3],
 }
 
+#[inline]
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn make_tables(coeff: u16) -> Tables {
-    let t = |shift: u32| -> ([u8; 64], [u8; 64]) {
+    // table entry x = coeff*(x<<shift) = c_s*x, c_s = coeff*2^shift; c*x
+    // for 6-bit x is the XOR of xtime^j(c) over set bits j of x. Avoids
+    // the bit-serial gf16_mul loop per entry.
+    let t = |c: u16| -> ([u8; 64], [u8; 64]) {
+        let mut d = [0u16; 6];
+        d[0] = c;
+        for j in 1..6 {
+            d[j] = gf16_mul2(d[j - 1]);
+        }
         let mut lo = [0u8; 64];
         let mut hi = [0u8; 64];
-        for x in 0..64usize {
-            let p = gf16_mul(coeff, (x as u16) << shift);
+        for x in 1..64usize {
+            let mut p = 0u16;
+            for j in 0..6 {
+                if x & (1 << j) != 0 {
+                    p ^= d[j];
+                }
+            }
             lo[x] = p as u8;
             hi[x] = (p >> 8) as u8;
         }
         (lo, hi)
     };
-    let (l0, h0) = t(0);
-    let (l1, h1) = t(6);
-    let (l2, h2) = t(12);
+    let x6 = |mut v: u16| {
+        for _ in 0..6 {
+            v = gf16_mul2(v);
+        }
+        v
+    };
+    let (l0, h0) = t(coeff);
+    let (l1, h1) = t(x6(coeff));
+    let (l2, h2) = t(x6(x6(coeff)));
     let load = |v: &[u8; 64]| _mm512_loadu_si512(v.as_ptr() as _);
     Tables {
         lo: [load(&l0), load(&l1), load(&l2)],
@@ -47,6 +67,7 @@ unsafe fn make_tables(coeff: u16) -> Tables {
     }
 }
 
+#[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
 unsafe fn muladd_block(dst: *mut u8, src: *const u8, t: &Tables, add: bool) {
     let ta = _mm512_loadu_si512(src as _); // hi bytes
@@ -78,6 +99,48 @@ unsafe fn muladd_block(dst: *mut u8, src: *const u8, t: &Tables, add: bool) {
     _mm512_storeu_si512(dst.add(64) as _, tpl);
 }
 
+// Per-call loops must be #[target_feature] fns (see shuffle_avx2).
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn prepare_run(dst: &mut [u8], src: &[u8]) {
+    let mut i = 0;
+    while i + BLK <= src.len() {
+        crate::shuffle_avx512::prepare_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
+        i += BLK;
+    }
+    if i < src.len() {
+        crate::shuffle_avx512::prepare_scalar(&mut dst[i..], &src[i..]);
+    } else {
+        for b in dst[i..].iter_mut() {
+            *b = 0;
+        }
+    }
+}
+
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn finish_run(dst: &mut [u8], src: &[u8]) {
+    let mut i = 0;
+    while i + BLK <= dst.len() {
+        crate::shuffle_avx512::finish_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
+        i += BLK;
+    }
+    if i < dst.len() {
+        crate::shuffle_avx512::finish_scalar(&mut dst[i..], &src[i..]);
+    }
+}
+
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+unsafe fn muladd_run(dst: &mut [u8], src: &[u8], coeff: u16, add: bool) {
+    let t = make_tables(coeff);
+    let mut i = 0;
+    while i + BLK <= src.len() {
+        muladd_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &t, add);
+        i += BLK;
+    }
+    if i < src.len() {
+        crate::shuffle_avx512::muladd_scalar(&mut dst[i..], &src[i..], coeff, add);
+    }
+}
+
 impl GfKernel for ShuffleVbmi {
     fn id(&self) -> i32 {
         14 // GF16_SHUFFLE_VBMI
@@ -96,61 +159,19 @@ impl GfKernel for ShuffleVbmi {
     }
 
     fn prepare(&self, dst: &mut [u8], src: &[u8]) {
-        let mut i = 0;
-        unsafe {
-            while i + BLK <= src.len() {
-                crate::shuffle_avx512::prepare_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
-                i += BLK;
-            }
-        }
-        if i < src.len() {
-            crate::shuffle_avx512::prepare_scalar(&mut dst[i..], &src[i..]);
-        } else {
-            for b in dst[i..].iter_mut() {
-                *b = 0;
-            }
-        }
+        unsafe { prepare_run(dst, src) }
     }
 
     fn finish(&self, dst: &mut [u8], src: &[u8]) {
-        let mut i = 0;
-        unsafe {
-            while i + BLK <= dst.len() {
-                crate::shuffle_avx512::finish_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i));
-                i += BLK;
-            }
-        }
-        if i < dst.len() {
-            crate::shuffle_avx512::finish_scalar(&mut dst[i..], &src[i..]);
-        }
+        unsafe { finish_run(dst, src) }
     }
 
     fn muladd(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
-        unsafe {
-            let t = make_tables(coeff);
-            let mut i = 0;
-            while i + BLK <= src.len() {
-                muladd_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &t, true);
-                i += BLK;
-            }
-            if i < src.len() {
-                crate::shuffle_avx512::muladd_scalar(&mut dst[i..], &src[i..], coeff, true);
-            }
-        }
+        unsafe { muladd_run(dst, src, coeff, true) }
     }
 
     fn mul(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
-        unsafe {
-            let t = make_tables(coeff);
-            let mut i = 0;
-            while i + BLK <= src.len() {
-                muladd_block(dst.as_mut_ptr().add(i), src.as_ptr().add(i), &t, false);
-                i += BLK;
-            }
-            if i < src.len() {
-                crate::shuffle_avx512::muladd_scalar(&mut dst[i..], &src[i..], coeff, false);
-            }
-        }
+        unsafe { muladd_run(dst, src, coeff, false) }
     }
 }
 
