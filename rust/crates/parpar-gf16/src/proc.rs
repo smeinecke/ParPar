@@ -108,7 +108,14 @@ enum Cmd {
 /// Worker-owned compute state (single-threaded access inside the worker).
 struct Worker {
     exponents: Vec<u16>,
-    outputs: Vec<Vec<u8>>,
+    /// accumulated outputs in the C++ tile-interleaved layout
+    /// `[round][output][tile]` - every round's output tiles sit
+    /// contiguous so a tile-major multiply sweeps sequential addresses
+    /// instead of jumping between per-output regions
+    outputs_flat: Vec<u8>,
+    /// tile granularity + packed length the flat layout was built for
+    out_tile: usize,
+    layout_len: usize,
     output_cksum: Vec<u64>,
     processing_add: bool,
     batch: Vec<StagedInput>,
@@ -120,9 +127,77 @@ struct Worker {
     chunk_size: u32,
 }
 
+/// Multiply-loop tile resolution (also `GfInfo.chunk_size`): user
+/// loopTileSize wins, else the kernel's idealChunkSize floored at 64KiB -
+/// per-task dispatch amortises over tile bytes and a 64KiB tile keeps the
+/// dst tile plus the batch's input window L2-resident.
+fn resolve_tile_len(kernel: &dyn GfKernel, chunk_size: u32, len: usize) -> usize {
+    let block = kernel.block_len().max(1);
+    let t = if chunk_size > 0 {
+        chunk_size as usize
+    } else {
+        (crate::kernel::method_info(kernel.id()).target_chunk as usize).max(64 * 1024)
+    };
+    t.max(block).min(len.max(1)).div_ceil(block) * block
+}
+
 impl Worker {
     fn aligned_size(&self, kernel: &dyn GfKernel) -> usize {
         packed_len(kernel, self.current_slice_size as usize)
+    }
+
+    /// Contiguous copy of output `idx`'s accumulated packed data
+    /// (`layout_len` bytes) out of the interleaved layout - used by the
+    /// Output command and the output checksum.
+    fn gather_output(&self, idx: usize) -> Vec<u8> {
+        let len = self.layout_len;
+        let tile = self.out_tile.max(1);
+        let nouts = self.exponents.len().max(1);
+        let mut tmp = vec![0u8; len];
+        for r in 0..len.div_ceil(tile) {
+            let tb = (len - r * tile).min(tile);
+            let off = (r * nouts + idx) * tile;
+            tmp[r * tile..r * tile + tb].copy_from_slice(&self.outputs_flat[off..off + tb]);
+        }
+        tmp
+    }
+
+    /// Rebuild `outputs_flat` for `nouts` outputs over `len` packed bytes,
+    /// preserving existing contributions when only the packed length grew
+    /// (same tile granularity => same in-row offsets, so a prefix copy
+    /// keeps every stored round).
+    fn rebuild_outputs(&mut self, kernel: &dyn GfKernel, len: usize, nouts: usize) {
+        let tile = resolve_tile_len(kernel, self.chunk_size, len);
+        let nrounds = len.div_ceil(tile);
+        let need = nrounds * nouts * tile;
+        if tile == self.out_tile && len >= self.layout_len {
+            let mut new_flat = vec![0u8; need];
+            let keep = self.outputs_flat.len().min(new_flat.len());
+            new_flat[..keep].copy_from_slice(&self.outputs_flat[..keep]);
+            self.outputs_flat = new_flat;
+        } else {
+            let old = std::mem::take(&mut self.outputs_flat);
+            if !old.is_empty() && self.out_tile > 0 && self.layout_len > 0 {
+                // tile granularity changed: migrate output by output
+                let old_tile = self.out_tile;
+                let old_len = self.layout_len;
+                let old_nouts = self.exponents.len().max(1);
+                let mut new_flat = vec![0u8; need];
+                for o in 0..old_nouts.min(nouts) {
+                    for r in 0..old_len.div_ceil(old_tile) {
+                        let tb = (old_len - r * old_tile).min(old_tile);
+                        let so = (r * old_nouts + o) * old_tile;
+                        let d = (r * nouts + o) * tile;
+                        new_flat[d..d + tb].copy_from_slice(&old[so..so + tb]);
+                    }
+                }
+                self.outputs_flat = new_flat;
+            } else {
+                self.outputs_flat = vec![0u8; need];
+            }
+        }
+        self.out_tile = tile;
+        self.layout_len = len;
     }
 
     /// discardOutput(): after an Ended event, the next add/end resets
@@ -135,11 +210,44 @@ impl Worker {
         }
     }
 
+    /// Inputs per flush for a given output count - shared by the worker's
+    /// flush trigger and the caller-side staging cap. `aligned` bounds the
+    /// staged memory footprint: the group never grows past ~256MiB of
+    /// staging per configured staging area.
+    fn effective_batch_for(nouts: usize, base: usize, aligned: usize) -> usize {
+        let base = base.max(1);
+        if nouts <= base {
+            return base;
+        }
+        let optimal = ((2 * nouts) as f64).sqrt();
+        let mut group = (optimal / base as f64).round().clamp(1.0, 4.0) as usize;
+        // bound staged bytes: staging_limit areas are added by the caller
+        let mem_cap = (128 * 1024 * 1024 / aligned.max(1) / base.max(1)).max(1);
+        group = group.min(mem_cap);
+        base * group
+    }
+
+    /// Inputs per flush. The staged batch size is a pure scheduling choice
+    /// (output is identical either way): each flush sweeps every output
+    /// region once, so the multiply's dst traffic scales as
+    /// nouts*aligned/batch while src work stays fixed - the minimum of
+    /// batch + 2*nouts/batch sits near batch = sqrt(2*nouts). Capped at 4x
+    /// the configured size so staging memory stays bounded and tail
+    /// flushes don't wait on oversized batches.
+    fn effective_batch(&self, kernel: &dyn GfKernel) -> usize {
+        Self::effective_batch_for(
+            self.exponents.len(),
+            self.input_batchsize as usize,
+            self.aligned_size(kernel),
+        )
+    }
+
     fn flush_batch(
         &mut self,
         kernel: &Arc<dyn GfKernel>,
         shared: &Shared,
         emit: &dyn Fn(ProcEvent),
+        tail: bool,
     ) {
         if self.batch.is_empty() {
             return;
@@ -160,9 +268,16 @@ impl Worker {
             shared.pending.fetch_sub(n, Ordering::Release);
             return;
         }
-        if self.outputs.len() < self.exponents.len() {
-            self.outputs
-                .resize_with(self.exponents.len(), || vec![0u8; len]);
+        // the flat layout must cover (rounds x outputs x tile) for the
+        // current packed length; SyncRecovery/SliceSize keep it in step,
+        // but FreeMem or an exponents bump can leave it short
+        let need = if self.out_tile > 0 {
+            len.div_ceil(self.out_tile) * self.exponents.len() * self.out_tile
+        } else {
+            usize::MAX
+        };
+        if self.layout_len != len || need > self.outputs_flat.len() {
+            self.rebuild_outputs(&**kernel, len, self.exponents.len());
         }
         let mut coeffs: Vec<Vec<u16>> = Vec::with_capacity(staged.len());
         for inp in staged.iter_mut() {
@@ -182,37 +297,44 @@ impl Worker {
         }
 
         let nthreads = (shared.num_threads.load(Ordering::Relaxed) as usize).clamp(1, 32);
-        let nouts = self.outputs.len();
-        let block = kernel.block_len().max(1);
-        // tile-major ordering (mirrors the C++ idealChunkSize loop): each
-        // tile's input region stays cache-hot while all outputs multiply
-        // through it - output-major order would re-read every packed input
-        // from DRAM per output
-        let tile_len = if self.chunk_size > 0 {
-            self.chunk_size as usize
+        let nouts = self.exponents.len();
+        // scale the fan-out to the demand: each worker sustains ~8GB/s of
+        // muladd while the input feed supplies ~1GB/s per output column,
+        // so ceil(nouts/8) threads keep pace - spawning the full hardware
+        // count only oversubscribes cores against the serial feed thread
+        // (reader/hasher). The tail flush runs once the feed is done and
+        // gets everything.
+        let nthreads = if tail {
+            nthreads
         } else {
-            crate::kernel::method_info(kernel.id()).target_chunk as usize
+            nthreads.min((nouts / 8 + 1).max(1))
         };
-        let tile_len = tile_len.max(block).min(len).div_ceil(block) * block;
+        // tile_len comes from the layout built by rebuild_outputs so the
+        // flat index (round*nouts + out)*tile stays consistent
+        let tile_len = self.out_tile;
         let first_mul = !self.processing_add;
         let kernel_ref: &dyn GfKernel = &**kernel;
 
         // tasks: (tile offset, tile len, output index, dst slice) -
         // tile-major order so threads sweep the same tile range together.
-        // Each output is sliced into tiles via one chunks_mut borrow -
-        // slices of different outputs never alias (separate allocs)
-        let mut out_tiles: Vec<std::slice::ChunksMut<u8>> = self
-            .outputs
-            .iter_mut()
-            .map(|o| o.chunks_mut(tile_len))
-            .collect();
-        let ntiles = out_tiles.first().map(|c| c.len()).unwrap_or(0);
-        let mut tasks: Vec<(usize, usize, usize, &mut [u8])> = Vec::with_capacity(ntiles * nouts);
-        for t in 0..ntiles {
-            let toff = t * tile_len;
-            for (o, ch) in out_tiles.iter_mut().enumerate() {
-                let dst = ch.next().unwrap();
-                tasks.push((toff, dst.len(), o, dst));
+        // The flat region is chopped per round then per output: each
+        // round's output tiles are adjacent, so a thread's contiguous
+        // task group writes a contiguous dst span (C++ memProcessing
+        // layout) instead of jumping between per-output regions
+        let nrounds = len.div_ceil(tile_len.max(1));
+        let mut tasks: Vec<(usize, usize, usize, &mut [u8])> = Vec::with_capacity(nrounds * nouts);
+        if nouts > 0 {
+            let mut round_iters: Vec<std::slice::ChunksMut<u8>> = self
+                .outputs_flat
+                .chunks_mut(nouts * tile_len)
+                .map(|r| r.chunks_mut(tile_len))
+                .collect();
+            for (t, ch) in round_iters.iter_mut().enumerate() {
+                let toff = t * tile_len;
+                let tl = (len - toff).min(tile_len);
+                for (o, dst) in ch.by_ref().enumerate() {
+                    tasks.push((toff, tl, o, &mut dst[..tl]));
+                }
             }
         }
         let ntasks = tasks.len();
@@ -220,6 +342,11 @@ impl Worker {
         let packed_inputs: Vec<&[u8]> = staged.iter().map(|i| &i.packed[..]).collect();
         let work = |group: Vec<(usize, usize, usize, &mut [u8])>| {
             for (toff, tl, o, dst) in group {
+                // general-coefficient inputs are accumulated two at a time
+                // (C++ procRegions=2): a fused muladd2 does one dst
+                // load/store per pair. XOR accumulation commutes, so a
+                // pending single pairs with the next general input
+                let mut pending: Option<(&[u8], u16)> = None;
                 for (i, packed) in packed_inputs.iter().enumerate() {
                     // a staged input may be shorter than tl if the slice
                     // size grew after staging - treat the missing region as
@@ -250,8 +377,17 @@ impl Worker {
                             kernel_ref.mul(dst, src, c);
                             dst[src.len()..].fill(0);
                         }
-                        c => kernel_ref.muladd(dst, src, c),
+                        c => {
+                            if let Some((ps, pc)) = pending.take() {
+                                kernel_ref.muladd2(dst, ps, pc, src, c);
+                            } else {
+                                pending = Some((src, c));
+                            }
+                        }
                     }
+                }
+                if let Some((ps, pc)) = pending {
+                    kernel_ref.muladd(dst, ps, pc);
                 }
             }
         };
@@ -266,7 +402,19 @@ impl Worker {
                     if group.is_empty() {
                         continue;
                     }
-                    sc.spawn(move || work(group));
+                    sc.spawn(move || {
+                        // the multiply is elastic background work: run the
+                        // workers nice'd so they absorb spare cycles instead
+                        // of oversubscribing cores against the pipeline's
+                        // serial feed (reader/hasher/consumer) chain
+                        #[cfg(unix)]
+                        unsafe {
+                            let p = libc::sched_param { sched_priority: 0 };
+                            libc::sched_setscheduler(0, libc::SCHED_IDLE, &p);
+                            libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+                        }
+                        work(group)
+                    });
                 }
             });
         } else {
@@ -304,10 +452,11 @@ impl Worker {
 
     fn finalize_cksums(&mut self, kernel: &dyn GfKernel) {
         let len = self.aligned_size(kernel);
-        self.output_cksum = self
-            .outputs
-            .iter()
-            .map(|o| cksum_update(0, &o[..len.min(o.len())]))
+        self.output_cksum = (0..self.exponents.len())
+            .map(|o| {
+                let g = self.gather_output(o);
+                cksum_update(0, &g[..len.min(g.len())])
+            })
             .collect();
     }
 }
@@ -390,7 +539,9 @@ impl NativeGfProc {
         let w_kernel = kernel.clone();
         let mut w = Worker {
             exponents: Vec::new(),
-            outputs: Vec::new(),
+            outputs_flat: Vec::new(),
+            out_tile: 0,
+            layout_len: 0,
             output_cksum: Vec::new(),
             processing_add: false,
             batch: Vec::new(),
@@ -436,13 +587,13 @@ impl NativeGfProc {
                     Cmd::Input(si) => {
                         w.maybe_discard();
                         w.batch.push(si);
-                        if w.batch.len() as u32 == w.input_batchsize {
-                            w.flush_batch(&w_kernel, &w_shared, &emit);
+                        if w.batch.len() >= w.effective_batch(&*w_kernel) {
+                            w.flush_batch(&w_kernel, &w_shared, &emit, false);
                         }
                     }
                     Cmd::End { token } => {
                         w.maybe_discard();
-                        w.flush_batch(&w_kernel, &w_shared, &emit);
+                        w.flush_batch(&w_kernel, &w_shared, &emit, true);
                         w.finalize_cksums(&*w_kernel);
                         emit(ProcEvent::Ended { token });
                         w.needs_discard = true;
@@ -454,24 +605,19 @@ impl NativeGfProc {
                     } => {
                         // outputs can be empty after FreeMem even though the
                         // caller-side index bound (outputs_count) still passes
-                        let valid = if index < w.outputs.len() {
-                            if index < w.output_cksum.len() {
-                                let plen = w.aligned_size(&*w_kernel);
-                                let src = &w.outputs[index];
-                                cksum_update(0, &src[..plen.min(src.len())])
-                                    == w.output_cksum[index]
-                            } else {
-                                true
-                            }
+                        let have = index < w.exponents.len() && !w.outputs_flat.is_empty();
+                        let valid = if have && index < w.output_cksum.len() {
+                            let plen = w.aligned_size(&*w_kernel);
+                            let g = w.gather_output(index);
+                            cksum_update(0, &g[..plen.min(g.len())]) == w.output_cksum[index]
                         } else {
-                            false
+                            have
                         };
                         let n = w.current_slice_size as usize;
                         let avail = n.min(out.data.len());
-                        if index < w.outputs.len() {
-                            let src = std::mem::take(&mut w.outputs[index]);
+                        if have {
+                            let src = w.gather_output(index);
                             w_kernel.finish(&mut out.data[..avail], &src);
-                            w.outputs[index] = src;
                             out.len = avail;
                         } else {
                             out.data[..avail].fill(0);
@@ -488,7 +634,11 @@ impl NativeGfProc {
                         if w.exponents.len() != count {
                             w.exponents.resize(count, 1);
                         }
-                        w.outputs = vec![vec![0u8; w.aligned_size(&*w_kernel)]; count];
+                        let len = w.aligned_size(&*w_kernel);
+                        let tile = resolve_tile_len(&*w_kernel, w.chunk_size, len);
+                        w.out_tile = tile;
+                        w.layout_len = len;
+                        w.outputs_flat = vec![0u8; len.div_ceil(tile.max(1)) * count * tile];
                         w.output_cksum.clear();
                         w.processing_add = false;
                     }
@@ -500,10 +650,9 @@ impl NativeGfProc {
                         // aligned(current) or the next flush indexes past the
                         // packed inputs
                         let need = w.aligned_size(&*w_kernel);
-                        for o in w.outputs.iter_mut() {
-                            if o.len() < need {
-                                o.resize(need, 0);
-                            }
+                        if need != w.layout_len && !w.outputs_flat.is_empty() {
+                            let nouts = w.exponents.len();
+                            w.rebuild_outputs(&*w_kernel, need, nouts);
                         }
                     }
                     Cmd::FreeMem => {
@@ -511,7 +660,9 @@ impl NativeGfProc {
                         // keeps the staging queue: staged inputs must still
                         // flush (dropping them would lose contributions AND
                         // wedge pending, since no InputDone would ever fire)
-                        w.outputs.clear();
+                        w.outputs_flat.clear();
+                        w.layout_len = 0;
+                        w.out_tile = 0;
                         w.output_cksum.clear();
                     }
                     Cmd::Close => break,
@@ -539,7 +690,15 @@ impl NativeGfProc {
 
     /// Capacity for new inputs (used by the composite's can_add probing).
     pub fn has_staging_room(&self) -> bool {
-        let cap = self.staging_limit * self.input_batchsize.max(1) as usize;
+        let batch = Worker::effective_batch_for(
+            self.shared.outputs_count.load(Ordering::Acquire),
+            self.input_batchsize as usize,
+            packed_len(
+                &*self.kernel,
+                self.shared.current_slice_size.load(Ordering::Acquire) as usize,
+            ),
+        );
+        let cap = self.staging_limit * batch;
         self.shared.pending.load(Ordering::Acquire) < cap
     }
 

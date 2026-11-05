@@ -8,6 +8,9 @@ description = "Native Rust GF(2^16) framework and kernels for ParPar"
 [dependencies]
 parpar-backend = { path = "../parpar-backend" }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # FFI oracle only builds/links on gnu targets (musl cross-tests run the
 # native-only unit tests).
 [target.'cfg(target_env = "gnu")'.dev-dependencies]

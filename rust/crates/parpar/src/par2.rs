@@ -858,11 +858,14 @@ where
         block_out: Box<[u8]>,
     ) -> Result<Box<dyn HasherInput>> {
         if self.inner.borrow().native_hashers {
-            // lane-split: the sequential read thread computes the file MD5
-            // and deposits it via set_file_md5; the hasher only runs the
-            // per-slice block MD5 + CRC lane
+            // lane-split: the sequential read thread computes the external
+            // lane(s) and deposits them via set_file_md5/set_block_states;
+            // with 64B-aligned slices the producer ships per-slice lane0
+            // states too, leaving only CRC + finalisation here
             return Ok(Box::new(parpar_hasher::NativeHasherInput::new_ext(
-                slice_size, block_out,
+                slice_size,
+                block_out,
+                slice_size % 64 == 0,
             )));
         }
         Ok(Box::new(
@@ -1517,6 +1520,15 @@ impl Par2File {
     pub fn set_file_md5(&mut self, md5: &[u8; 16]) {
         if let Some(h) = self.hasher.as_mut() {
             h.set_file_md5(md5);
+        }
+    }
+
+    /// Deposit per-slice lane0 chain states produced by the read thread
+    /// (lane-split states mode) - appended to the hasher's state queue in
+    /// stream order, before the chunks that complete those slices hash.
+    pub fn set_block_states(&mut self, states: &[[u32; 4]]) {
+        if let Some(h) = self.hasher.as_mut() {
+            h.set_block_states(states);
         }
     }
 

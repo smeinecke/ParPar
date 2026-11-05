@@ -299,14 +299,13 @@ fn run(mut cfg: args::CliConfig) -> std::result::Result<(), String> {
         return Err("this build has no FFI backend (built without the `ffi` feature)".into());
     }
     let backend = parpar::native_backend::NativeBackend::new();
-    run_generate(
-        &cfg,
-        &mut files,
-        slice_def,
-        o,
-        env,
-        par2::SharedBackend::new(backend),
-    )
+    // the pure-Rust backend IS native: route hashers + procs through the
+    // shared native registries (matches the e2e-native harness) and
+    // enable lane-split producer hashing
+    let mut shared = par2::SharedBackend::new(backend);
+    shared.set_native_hashers(true);
+    shared.set_native_proc(true);
+    run_generate(&cfg, &mut files, slice_def, o, env, shared)
 }
 
 fn run_generate<B: ComputeBackend>(

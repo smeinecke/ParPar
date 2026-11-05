@@ -78,8 +78,9 @@ pub(crate) unsafe fn finish_block(dst: *mut u8, src: *const u8) {
     _mm256_storeu_si256(dst.add(32) as _, _mm256_permute2x128_si256(x, y, 0x31));
 }
 
+/// c*src for one packed block, as (lo-plane, hi-plane) vectors.
 #[target_feature(enable = "avx2")]
-unsafe fn muladd_block(dst: *mut u8, src: *const u8, t: &Tables, add: bool) {
+unsafe fn mul_plane(src: *const u8, t: &Tables) -> (__m256i, __m256i) {
     let nmask = _mm256_set1_epi8(0x0f);
     let hi = _mm256_loadu_si256(src as _);
     let lo = _mm256_loadu_si256(src.add(32) as _);
@@ -95,10 +96,36 @@ unsafe fn muladd_block(dst: *mut u8, src: *const u8, t: &Tables, add: bool) {
     tph = _mm256_xor_si256(tph, _mm256_shuffle_epi8(t.hi[2], hn));
     tpl = _mm256_xor_si256(tpl, _mm256_shuffle_epi8(t.lo[3], hnh));
     tph = _mm256_xor_si256(tph, _mm256_shuffle_epi8(t.hi[3], hnh));
+    (tpl, tph)
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn muladd_block(dst: *mut u8, src: *const u8, t: &Tables, add: bool) {
+    let (mut tpl, mut tph) = mul_plane(src, t);
     if add {
         tpl = _mm256_xor_si256(tpl, _mm256_loadu_si256(dst.add(32) as _));
         tph = _mm256_xor_si256(tph, _mm256_loadu_si256(dst as _));
     }
+    _mm256_storeu_si256(dst as _, tph);
+    _mm256_storeu_si256(dst.add(32) as _, tpl);
+}
+
+/// dst ^= ca*sa ^ cb*sb for one packed block - both products accumulate
+/// into a single dst load/store (C++ procRegions=2 fused pass).
+#[target_feature(enable = "avx2")]
+unsafe fn muladd2_block(
+    dst: *mut u8,
+    src_a: *const u8,
+    ta: &Tables,
+    src_b: *const u8,
+    tb: &Tables,
+) {
+    let (mut tpl, mut tph) = mul_plane(src_a, ta);
+    let (pl, ph) = mul_plane(src_b, tb);
+    tpl = _mm256_xor_si256(tpl, pl);
+    tph = _mm256_xor_si256(tph, ph);
+    tpl = _mm256_xor_si256(tpl, _mm256_loadu_si256(dst.add(32) as _));
+    tph = _mm256_xor_si256(tph, _mm256_loadu_si256(dst as _));
     _mm256_storeu_si256(dst as _, tph);
     _mm256_storeu_si256(dst.add(32) as _, tpl);
 }
@@ -214,6 +241,51 @@ impl GfKernel for ShuffleAvx2 {
             if i < src.len() {
                 muladd_scalar(&mut dst[i..], &src[i..], coeff, true);
             }
+        }
+    }
+
+    fn muladd2(&self, dst: &mut [u8], src_a: &[u8], coeff_a: u16, src_b: &[u8], coeff_b: u16) {
+        let n = src_a.len().min(src_b.len());
+        unsafe {
+            let ta = make_tables(coeff_a);
+            let tb = make_tables(coeff_b);
+            let mut i = 0;
+            // 4x unroll: independent block chains give the OoO engine
+            // parallel pshufb pipelines instead of a serial block stream
+            while i + 4 * BLK <= n {
+                for u in 0..4 {
+                    muladd2_block(
+                        dst.as_mut_ptr().add(i + u * BLK),
+                        src_a.as_ptr().add(i + u * BLK),
+                        &ta,
+                        src_b.as_ptr().add(i + u * BLK),
+                        &tb,
+                    );
+                }
+                i += 4 * BLK;
+            }
+            while i + BLK <= n {
+                muladd2_block(
+                    dst.as_mut_ptr().add(i),
+                    src_a.as_ptr().add(i),
+                    &ta,
+                    src_b.as_ptr().add(i),
+                    &tb,
+                );
+                i += BLK;
+            }
+            if i < n {
+                muladd_scalar(&mut dst[i..], &src_a[i..n], coeff_a, true);
+                muladd_scalar(&mut dst[i..], &src_b[i..n], coeff_b, true);
+            }
+        }
+        // a staged input can be shorter than its partner (slice size grew
+        // after staging) - the longer tail still contributes
+        if src_a.len() > n {
+            self.muladd(&mut dst[n..], &src_a[n..], coeff_a);
+        }
+        if src_b.len() > n {
+            self.muladd(&mut dst[n..], &src_b[n..], coeff_b);
         }
     }
 

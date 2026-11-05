@@ -429,3 +429,34 @@ fn multithreaded() {
         }
     }
 }
+
+#[test]
+#[ignore]
+fn muladd_bench() {
+    use parpar_gf16::kernel::{self, GfKernel};
+    for method in [0, 19, 12, 18] {
+        let k: Box<dyn GfKernel> = match kernel::pick_explicit(method) {
+            Some(k) => k,
+            None => continue,
+        };
+        let tile = kernel::method_info(k.id()).target_chunk as usize;
+        let src = vec![0xabu8; tile.max(1)];
+        let mut dst = vec![0u8; tile.max(1)];
+        for _ in 0..1000 {
+            k.muladd(&mut dst, &src, 7);
+        }
+        let iters = (8u64 << 30) as usize / tile.max(1);
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            k.muladd(&mut dst, &src, 7);
+        }
+        let el = t.elapsed().as_secs_f64();
+        eprintln!(
+            "method={} tile={} muladd {:.2}s -> {:.2} GB/s",
+            method,
+            tile,
+            el,
+            (iters * tile) as f64 / el / 1e9
+        );
+    }
+}

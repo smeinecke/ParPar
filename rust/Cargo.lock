@@ -151,6 +151,7 @@ dependencies = [
 name = "parpar-gf16"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "parpar-backend",
  "parpar-ffi",
 ]

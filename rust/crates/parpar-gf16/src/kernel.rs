@@ -34,6 +34,14 @@ pub trait GfKernel: Send + Sync {
     fn finish(&self, dst: &mut [u8], src: &[u8]);
     /// dst ^= src * coeff over a packed region.
     fn muladd(&self, dst: &mut [u8], src: &[u8], coeff: u16);
+    /// dst ^= src_a * coeff_a ^ src_b * coeff_b in one dst sweep -
+    /// mirrors the C++ procRegions=2 interleave: the dst tile is loaded
+    /// and stored once for two inputs, halving dst traffic. Default is
+    /// two sequential muladds; kernels override with a fused pass.
+    fn muladd2(&self, dst: &mut [u8], src_a: &[u8], coeff_a: u16, src_b: &[u8], coeff_b: u16) {
+        self.muladd(dst, src_a, coeff_a);
+        self.muladd(dst, src_b, coeff_b);
+    }
     /// dst = src * coeff (overwrite) over a packed region.
     fn mul(&self, dst: &mut [u8], src: &[u8], coeff: u16);
 }
@@ -118,6 +126,9 @@ impl GfKernel for Renamed {
     }
     fn muladd(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
         self.inner.muladd(dst, src, coeff)
+    }
+    fn muladd2(&self, dst: &mut [u8], src_a: &[u8], coeff_a: u16, src_b: &[u8], coeff_b: u16) {
+        self.inner.muladd2(dst, src_a, coeff_a, src_b, coeff_b)
     }
     fn mul(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
         self.inner.mul(dst, src, coeff)

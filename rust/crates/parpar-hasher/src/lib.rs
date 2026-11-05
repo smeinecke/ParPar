@@ -20,6 +20,88 @@ use md5::{digest_bytes, md5_final_block, Md5Ctx, Md5X2, MD5_BLOCKSIZE};
 /// hashing): the reader streams chunk bytes through it and deposits the
 /// finished digest on the HasherInput.
 pub use md5::Md5Ctx as FileMd5Ctx;
+
+/// Producer-side lane-split hasher: runs BOTH MD5 lanes on the read
+/// thread through the x2 kernel (~same cost as one lane via ILP). Per
+/// slice it emits the lane0 chain state at the boundary (before the
+/// slice's <64B tail is finalised); at file end it emits the whole-file
+/// digest. The consumer then only runs CRC + the final-block step per
+/// slice instead of hashing all input bytes twice.
+///
+/// Only usable when slice_size % 64 == 0 so every slice boundary lands
+/// on a block edge (callers fall back to the file-lane-only split).
+pub struct LaneProducer {
+    x2: Md5X2,
+    tail: [u8; MD5_BLOCKSIZE],
+    tail_len: usize,
+    slice_size: u64,
+    slice_off: u64,
+    file_len: u64,
+}
+
+impl LaneProducer {
+    pub fn new(slice_size: u64) -> Self {
+        debug_assert!(slice_size % MD5_BLOCKSIZE as u64 == 0);
+        LaneProducer {
+            x2: Md5X2::new(),
+            tail: [0; MD5_BLOCKSIZE],
+            tail_len: 0,
+            slice_size,
+            slice_off: 0,
+            file_len: 0,
+        }
+    }
+
+    /// Feed a chunk; pushes a lane0 state to `states` at each completed
+    /// slice boundary (in stream order).
+    pub fn update(&mut self, mut data: &[u8], states: &mut Vec<[u32; 4]>) {
+        self.file_len = self.file_len.wrapping_add(data.len() as u64);
+        if self.tail_len > 0 {
+            let take = (MD5_BLOCKSIZE - self.tail_len).min(data.len());
+            self.tail[self.tail_len..self.tail_len + take].copy_from_slice(&data[..take]);
+            self.tail_len += take;
+            data = &data[take..];
+            if self.tail_len == MD5_BLOCKSIZE {
+                let blk = self.tail;
+                self.x2.update_block(&blk, &blk);
+                self.tail_len = 0;
+                self.slice_off += MD5_BLOCKSIZE as u64;
+                self.check_boundary(states);
+            }
+            if data.is_empty() {
+                return;
+            }
+        }
+        while data.len() >= MD5_BLOCKSIZE {
+            let blk = &data[..MD5_BLOCKSIZE];
+            self.x2.update_block(blk, blk);
+            self.slice_off += MD5_BLOCKSIZE as u64;
+            self.check_boundary(states);
+            data = &data[MD5_BLOCKSIZE..];
+        }
+        self.tail[..data.len()].copy_from_slice(data);
+        self.tail_len = data.len();
+    }
+
+    fn check_boundary(&mut self, states: &mut Vec<[u32; 4]>) {
+        if self.slice_off == self.slice_size {
+            states.push(self.x2.extract(HASH2X_BLOCK));
+            self.x2.init_lane(HASH2X_BLOCK);
+            self.slice_off = 0;
+        }
+    }
+
+    /// At EOF: emit the partial last slice's lane0 state (if any), then
+    /// finalise lane1 into the 16-byte file MD5.
+    pub fn finish(&mut self, states: &mut Vec<[u32; 4]>) -> [u8; 16] {
+        if self.slice_off > 0 {
+            states.push(self.x2.extract(HASH2X_BLOCK));
+        }
+        let mut st = self.x2.extract(HASH2X_FILE);
+        md5_final_block(&mut st, &self.tail[..self.tail_len], self.file_len, 0);
+        digest_bytes(&st)
+    }
+}
 use parpar_backend::{BackendError, HasherInput, HasherOutput, Result};
 
 const HASH2X_BLOCK: usize = 0;
@@ -84,6 +166,11 @@ struct InputCore {
     /// HasherInput before end() - update() then only runs lane0 (block
     /// MD5 + CRC), skipping the file-lane work entirely
     file_external: bool,
+    /// lane0 chain states are also produced externally (one per slice,
+    /// emitted at slice boundaries by LaneProducer) - update() then only
+    /// keeps CRC + the <64B tail; get_block pops the next shipped state
+    block_external: bool,
+    states: std::collections::VecDeque<[u32; 4]>,
 }
 
 impl InputCore {
@@ -96,12 +183,15 @@ impl InputCore {
             crc: Crc32::new(),
             data_len: [0, 0],
             file_external: false,
+            block_external: false,
+            states: std::collections::VecDeque::new(),
         }
     }
 
     fn reset(&mut self) {
         self.md5 = Md5X2::new();
         self.tmp_len = 0;
+        self.states.clear();
         self.pos_offset = 0;
         self.crc = Crc32::new();
         self.data_len = [0, 0];
@@ -153,11 +243,19 @@ impl InputCore {
             }
         }
 
-        while data.len() >= MD5_BLOCKSIZE + self.pos_offset {
-            let blk: &[u8] = &data[self.pos_offset..self.pos_offset + MD5_BLOCKSIZE];
-            self.crc.update(blk);
-            self.md5.update_block(blk, &data[..MD5_BLOCKSIZE]);
-            data = &data[MD5_BLOCKSIZE..];
+        // batched CRC over the contiguous shifted-window run (same bytes,
+        // one call) - per-window PCLMUL calls cost ~85ns setup each
+        let blocks = data.len().saturating_sub(self.pos_offset) / MD5_BLOCKSIZE;
+        if blocks > 0 {
+            self.crc
+                .update(&data[self.pos_offset..self.pos_offset + blocks * MD5_BLOCKSIZE]);
+            for _ in 0..blocks {
+                self.md5.update_block(
+                    &data[self.pos_offset..self.pos_offset + MD5_BLOCKSIZE],
+                    &data[..MD5_BLOCKSIZE],
+                );
+                data = &data[MD5_BLOCKSIZE..];
+            }
         }
 
         self.tmp[..data.len()].copy_from_slice(data);
@@ -179,18 +277,26 @@ impl InputCore {
                 let mut blk = [0u8; MD5_BLOCKSIZE];
                 blk.copy_from_slice(&self.tmp[..MD5_BLOCKSIZE]);
                 self.crc.update(&blk);
-                self.md5.update_lane0(&blk);
+                if !self.block_external {
+                    self.md5.update_lane0(&blk);
+                }
                 self.tmp_len = 0;
             }
             if data.is_empty() {
                 return;
             }
         }
-        while data.len() >= MD5_BLOCKSIZE {
-            let blk = &data[..MD5_BLOCKSIZE];
-            self.crc.update(blk);
-            self.md5.update_lane0(blk);
-            data = &data[MD5_BLOCKSIZE..];
+        // CRC is streamed in one call per contiguous run - per-64B calls
+        // cost ~85ns each in PCLMUL setup (~3s/GiB), batched it's ~0.1s
+        let full = data.len() / MD5_BLOCKSIZE * MD5_BLOCKSIZE;
+        if full > 0 {
+            self.crc.update(&data[..full]);
+            if !self.block_external {
+                for blk in data[..full].chunks_exact(MD5_BLOCKSIZE) {
+                    self.md5.update_lane0(blk);
+                }
+            }
+            data = &data[full..];
         }
         self.tmp[..data.len()].copy_from_slice(data);
         self.tmp_len = data.len();
@@ -214,7 +320,13 @@ impl InputCore {
 
     /// getBlock(md5crc, zeroPad): write 16-byte block MD5 + 4-byte CRC32.
     fn get_block(&mut self, out: &mut [u8], zero_pad: u64) {
-        let mut st = self.md5.extract(HASH2X_BLOCK);
+        let mut st = if self.block_external {
+            self.states
+                .pop_front()
+                .expect("lane0 state missing - reader not shipping slice states")
+        } else {
+            self.md5.extract(HASH2X_BLOCK)
+        };
         md5_final_block(
             &mut st,
             &self.tmp[self.pos_offset..],
@@ -282,10 +394,13 @@ impl NativeHasherInput {
 
     /// Lane-split variant: the whole-file MD5 is computed by the read
     /// thread and handed in via set_file_md5; this hasher only runs the
-    /// per-slice block MD5 + CRC lane.
-    pub fn new_ext(slice_size: u64, block_out: Box<[u8]>) -> Self {
+    /// per-slice block MD5 + CRC lane. When `ship_states` is set the read
+    /// thread also ships per-slice lane0 chain states (slice_size % 64
+    /// == 0 required), so this hasher only runs CRC + finalisation.
+    pub fn new_ext(slice_size: u64, block_out: Box<[u8]>, ship_states: bool) -> Self {
         let mut h = Self::new(slice_size, block_out);
         h.core.file_external = true;
+        h.core.block_external = ship_states;
         h
     }
 }
@@ -359,6 +474,10 @@ impl HasherInput for NativeHasherInput {
 
     fn set_file_md5(&mut self, md5: &[u8; 16]) {
         self.ext_md5 = Some(*md5);
+    }
+
+    fn set_block_states(&mut self, states: &[[u32; 4]]) {
+        self.core.states.extend(states.iter().copied());
     }
 
     fn reset(&mut self) -> Result<()> {

@@ -430,6 +430,10 @@ pub trait HasherInput: Send {
     /// Deposit a file MD5 computed outside the hasher (lane-split read
     /// thread). Backends that hash the file lane internally ignore it.
     fn set_file_md5(&mut self, _md5: &[u8; 16]) {}
+    /// Deposit per-slice lane0 chain states emitted by the read thread
+    /// (one per slice boundary, in order). Ignored by self-contained
+    /// hashers.
+    fn set_block_states(&mut self, _states: &[[u32; 4]]) {}
 }
 
 /// Multi-region output hasher (MD5Multi): hashes N equal-length buffers.

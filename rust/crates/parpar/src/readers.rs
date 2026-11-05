@@ -212,9 +212,15 @@ pub struct FileReaderData {
     /// the hash-queue slot is released exactly once even if hashed() ends
     /// up running twice (explicit call + Drop)
     hash_pending: bool,
-    /// whole-file MD5 computed on the producer thread (lane-split mode);
+    /// this chunk ends its file - the lane-split hasher thread finalises
+    /// the file's hash state here
+    pub eof: bool,
+    /// whole-file MD5 computed on the hasher thread (lane-split mode);
     /// set on the file's final chunk and deposited on the HasherInput
     pub file_md5: Option<[u8; 16]>,
+    /// per-slice lane0 chain states emitted at the slice boundaries this
+    /// chunk spans (lane-split states mode), in stream order
+    pub block_states: Vec<[u32; 4]>,
 }
 
 impl FileReaderData {
@@ -316,6 +322,24 @@ struct SeqInner {
     max_queue_per_file: AtomicU32,
 }
 
+/// Lane-split producer mode.
+#[derive(Clone, Copy)]
+pub enum LaneMode {
+    /// no producer-side hashing
+    Off,
+    /// producer computes only the whole-file MD5
+    FileOnly,
+    /// producer runs both MD5 lanes (x2) and ships per-slice lane0
+    /// chain states + the file digest; needs slice_size % 64 == 0
+    States(u64),
+}
+
+/// Per-open-file producer hashing state (keyed by reader_slot).
+enum LaneProd {
+    File(parpar_hasher::FileMd5Ctx),
+    States(parpar_hasher::LaneProducer),
+}
+
 /// `lib/fileseqreader.js` - sequential reader preferring in-order file
 /// progress with a bounded buffer pool and per-file hash queues.
 pub struct FileSeqReader {
@@ -323,10 +347,9 @@ pub struct FileSeqReader {
     inner: Arc<SeqInner>,
     req_slice_len: u64,
     req_chunk_len: u64,
-    /// producer thread also streams each file's bytes through a whole-file
-    /// MD5 context; the digest rides out on the file's last chunk
-    /// (lane-split hashing - the HasherInput then only runs block MD5+CRC)
-    compute_file_md5: bool,
+    /// producer thread also streams each file's bytes through the lane
+    /// hasher(s); results ride out on the file's chunks
+    lane_mode: LaneMode,
 }
 
 impl FileSeqReader {
@@ -352,14 +375,14 @@ impl FileSeqReader {
             }),
             req_slice_len: 0,
             req_chunk_len: 0,
-            compute_file_md5: false,
+            lane_mode: LaneMode::Off,
         }
     }
 
     /// Enable lane-split hashing: the producer thread computes each file's
-    /// whole-file MD5 and attaches it to the file's final chunk.
-    pub fn set_compute_file_md5(&mut self, on: bool) {
-        self.compute_file_md5 = on;
+    /// external hash lane(s) and attaches them to the file's chunks.
+    pub fn set_lane_mode(&mut self, mode: LaneMode) {
+        self.lane_mode = mode;
     }
 
     /// JS `reader.maxQueuePerFile = opts.readHashQueue`.
@@ -447,13 +470,20 @@ impl FileSeqReader {
     ) -> JsResult<()> {
         // JS performs the reads on background workers while the main loop
         // hashes; replicate that overlap with a scoped producer thread so
-        // the pread of chunk N+1 hides under the hashing of chunk N
+        // the pread of chunk N+1 hides under the hashing of chunk N. In
+        // lane-split mode a dedicated hasher thread sits between reader
+        // and consumer: reads stay off the MD5 dependency chain and the
+        // consumer keeps only CRC + finals + packing
         let chan_bound = self.inner.state.lock().unwrap().buf_count.max(1);
         let (tx, rx) = std::sync::mpsc::sync_channel::<JsResult<FileReaderData>>(chan_bound);
+        let (tx2, rx2) = std::sync::mpsc::sync_channel::<JsResult<FileReaderData>>(chan_bound);
         let mut first_err: Option<String> = None;
+        let mode = self.lane_mode;
         std::thread::scope(|s| {
-            let producer = s.spawn(|| self.produce(throttle, tx));
-            for item in rx {
+            let me: &Self = self;
+            let producer = s.spawn(move || me.produce(throttle, tx));
+            let hasher = s.spawn(move || me.hash_lane(mode, rx, tx2));
+            for item in rx2 {
                 let is_err = item.is_err();
                 if let Err(e) = &item {
                     if first_err.is_none() {
@@ -466,6 +496,7 @@ impl FileSeqReader {
                 }
             }
             let _ = producer.join();
+            let _ = hasher.join();
         });
         match first_err {
             Some(e) => Err(e),
@@ -474,7 +505,7 @@ impl FileSeqReader {
     }
 
     fn produce(
-        &mut self,
+        &self,
         throttle: Option<&ThrottleQueue>,
         tx: std::sync::mpsc::SyncSender<JsResult<FileReaderData>>,
     ) {
@@ -486,10 +517,6 @@ impl FileSeqReader {
                 &no_throttle
             }
         };
-        // lane-split file MD5: one streaming context per open file, keyed by
-        // its stable slot id (open_files reorder/remove makes indices unsafe)
-        let mut lane1: std::collections::HashMap<u64, parpar_hasher::FileMd5Ctx> =
-            std::collections::HashMap::new();
         loop {
             let mut st = self.inner.state.lock().unwrap();
             let buffer = match self.get_buf(&mut st) {
@@ -544,9 +571,6 @@ impl FileSeqReader {
                                     hash_queue: 0,
                                     slot,
                                 });
-                                if self.compute_file_md5 {
-                                    lane1.insert(slot, parpar_hasher::FileMd5Ctx::new());
-                                }
                                 st.lent_bufs = st.lent_bufs.saturating_sub(1);
                                 st.buf.push(buffer);
                             }
@@ -577,10 +601,10 @@ impl FileSeqReader {
             };
 
             // _doRead
-            let (rs, chunks, pos, info, slot) = {
+            let (rs, chunks, pos, info) = {
                 let ofile = &st.open_files[file_idx];
                 let (rs, chunks) = self.read_size(ofile.pos, self.files[ofile.info].size);
-                (rs, chunks, ofile.pos, ofile.info, ofile.slot)
+                (rs, chunks, ofile.pos, ofile.info)
             };
             let fd = match st.open_files[file_idx].fd.try_clone() {
                 Ok(fd) => fd,
@@ -625,12 +649,6 @@ impl FileSeqReader {
                 }
             };
 
-            // lane1: the file-MD5 stream hashes the raw bytes as read, on
-            // this producer thread, while the consumer runs block MD5+CRC
-            if let Some(ctx) = lane1.get_mut(&slot) {
-                ctx.update(&buffer[..n]);
-            }
-
             let new_pos = pos + n as u64;
             let fsize = self.files[info].size;
             if new_pos > fsize {
@@ -663,11 +681,9 @@ impl FileSeqReader {
                 reader: self.inner.clone(),
                 refs: 2,
                 hash_pending: true,
-                file_md5: if eof {
-                    lane1.remove(&slot).map(|mut c| c.finish())
-                } else {
-                    None
-                },
+                eof,
+                file_md5: None,
+                block_states: Vec::new(),
             };
             // JS hands out a view of the buffer and returns it via
             // hashed+release; deliver the buffer itself
@@ -682,6 +698,66 @@ impl FileSeqReader {
                 let mut st = self.inner.state.lock().unwrap();
                 st.open_files.remove(file_idx);
             }
+        }
+    }
+
+    /// Lane-split hasher thread: sits between the reader and the
+    /// consumer so the serial MD5 work runs off both of them. Keeps one
+    /// external-hash context per open file keyed by its stable slot id;
+    /// attaches per-slice lane0 chain states to every chunk and the
+    /// whole-file digest to the file's last chunk. `Off` just forwards.
+    fn hash_lane(
+        &self,
+        mode: LaneMode,
+        rx: std::sync::mpsc::Receiver<JsResult<FileReaderData>>,
+        tx: std::sync::mpsc::SyncSender<JsResult<FileReaderData>>,
+    ) {
+        use std::collections::HashMap;
+        let mut lanes: HashMap<u64, LaneProd> = HashMap::new();
+        let mut _upd = std::time::Duration::ZERO;
+        let mut _wait = std::time::Duration::ZERO;
+        for item in rx {
+            let item = match item {
+                Ok(mut data) => {
+                    if !matches!(mode, LaneMode::Off) {
+                        let lp = lanes.entry(data.reader_slot).or_insert_with(|| match mode {
+                            LaneMode::FileOnly => LaneProd::File(parpar_hasher::FileMd5Ctx::new()),
+                            LaneMode::States(ss) => {
+                                LaneProd::States(parpar_hasher::LaneProducer::new(ss))
+                            }
+                            LaneMode::Off => unreachable!(),
+                        });
+                        let _t = std::time::Instant::now();
+                        match lp {
+                            LaneProd::File(c) => c.update(&data.buffer),
+                            LaneProd::States(p) => p.update(&data.buffer, &mut data.block_states),
+                        }
+                        _upd += _t.elapsed();
+                        if data.eof {
+                            if let Some(lp) = lanes.remove(&data.reader_slot) {
+                                data.file_md5 = Some(match lp {
+                                    LaneProd::File(mut c) => c.finish(),
+                                    LaneProd::States(mut p) => p.finish(&mut data.block_states),
+                                });
+                            }
+                        }
+                    }
+                    Ok(data)
+                }
+                Err(e) => Err(e),
+            };
+            let _t = std::time::Instant::now();
+            if tx.send(item).is_err() {
+                return;
+            }
+            _wait += _t.elapsed();
+        }
+        if std::env::var_os("PARPAR_PERF").is_some() {
+            eprintln!(
+                "[perf] lane: upd={:.2}s send-wait={:.2}s",
+                _upd.as_secs_f64(),
+                _wait.as_secs_f64()
+            );
         }
     }
 }

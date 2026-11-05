@@ -10,7 +10,7 @@ use crate::fileinfo::FileInfo;
 use crate::generate::{PacketType, Par2Gen};
 use crate::outfile::Par2OutFile;
 use crate::par2::{GfCtx, RecoveryGen};
-use crate::readers::{file_chunk_reader, BufferPool, FileSeqReader};
+use crate::readers::{file_chunk_reader, BufferPool, FileSeqReader, LaneMode};
 use crate::throttle::ThrottleQueue;
 use parpar_backend::SliceBuf;
 
@@ -634,10 +634,19 @@ impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
         reader.set_buffers(std::mem::take(&mut self.buf_pool));
         reader.set_max_queue_per_file(self.gen.opts.read_hash_queue as u32);
         // lane-split hashing: when the native input hasher is active the
-        // reader computes each file's MD5 on the producer thread; the
-        // consumer-side hasher then only runs the block MD5 + CRC lane
-        let lane_split = self.gen.par2.gen.ctx.lane_split_inhash();
-        reader.set_compute_file_md5(lane_split);
+        // reader computes the external lane(s) on the producer thread.
+        // States mode (x2 on producer, per-slice lane0 states shipped)
+        // needs slice boundaries on 64B block edges.
+        let lane_mode = if self.gen.par2.gen.ctx.lane_split_inhash() && first {
+            if slice_size % 64 == 0 {
+                LaneMode::States(slice_size)
+            } else {
+                LaneMode::FileOnly
+            }
+        } else {
+            LaneMode::Off
+        };
+        reader.set_lane_mode(lane_mode);
 
         let mut slices_per_read = 0u64;
         if self.chunker.is_some() {
@@ -654,18 +663,27 @@ impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
         }
 
         let mut res: JsResult<()> = Ok(());
+        let _feed_t = std::time::Instant::now();
+        let mut _th = std::time::Duration::ZERO;
+        let mut _td = std::time::Duration::ZERO;
         let run_res = reader.run(self.seq_read_throttle.as_ref(), |r| {
             match r {
                 Ok(mut data) => {
                     let fidx = data.file_index;
                     if first {
                         let f = &mut self.gen.par2.files[fidx];
-                        // lane-split: deposit the producer-thread file MD5
-                        // before the final chunk's process_hash -> end()
+                        // lane-split: deposit producer-thread hash results
+                        // before the chunk's process_hash -> get_block/end()
+                        if !data.block_states.is_empty() {
+                            f.set_block_states(&data.block_states);
+                        }
                         if let Some(d) = data.file_md5 {
                             f.set_file_md5(&d);
                         }
-                        if let Err(e) = f.process_hash(&data.buffer) {
+                        let _t = std::time::Instant::now();
+                        let r = f.process_hash(&data.buffer);
+                        _th += _t.elapsed();
+                        if let Err(e) = r {
                             res = Err(e.to_string());
                             return;
                         }
@@ -761,7 +779,10 @@ impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
                                     .with_reclaim(data.buf_reclaimer());
                             let f = &mut self.gen.par2.files[fidx];
                             let gen = &mut self.gen.par2.gen;
-                            if let Err(e) = f.process_data(gen, buf) {
+                            let _t = std::time::Instant::now();
+                            let r = f.process_data(gen, buf);
+                            _td += _t.elapsed();
+                            if let Err(e) = r {
                                 res = Err(e.to_string());
                                 return;
                             }
@@ -796,6 +817,14 @@ impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
         // (JS shares this._buf); run() only finishes once all lent buffers
         // are back
         self.buf_pool = reader.take_pooled();
+        if std::env::var_os("PARPAR_PERF").is_some() {
+            eprintln!(
+                "[perf] feed={:.2}s hash={:.2}s data={:.2}s",
+                _feed_t.elapsed().as_secs_f64(),
+                _th.as_secs_f64(),
+                _td.as_secs_f64()
+            );
+        }
         run_res?;
         res
     }
