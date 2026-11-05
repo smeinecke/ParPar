@@ -11,6 +11,8 @@ mod crc32;
 mod md5;
 #[cfg(target_arch = "aarch64")]
 mod md5_neon;
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+mod md5_aarch64;
 mod md5mb;
 
 use crc32::{crc_zero_pad, Crc32};

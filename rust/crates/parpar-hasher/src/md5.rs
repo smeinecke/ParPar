@@ -1445,6 +1445,10 @@ impl Md5X2 {
             // (dedicated arm64 GPR asm, no NEON) - a serial MD5 chain gains
             // nothing from 2-lane SIMD and pays for it in vector-op latency.
             // Interleaved lockstep version recovers most of the asm's ILP.
+            // NOTE: the md5_aarch64 asm port measured SLOWER than this on
+            // web02's OoO core (0.27 vs 0.38 GB/s) - LLVM's dual-chain
+            // interleave wins there. The asm stays compiled+tested for
+            // weaker/in-order cores if ever needed.
             let (l0, l1) = self.state.split_at_mut(4);
             let l0: &mut [u32; 4] = l0.try_into().unwrap();
             let l1: &mut [u32; 4] = l1.try_into().unwrap();
