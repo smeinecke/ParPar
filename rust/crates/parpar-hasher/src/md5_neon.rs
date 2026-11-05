@@ -104,6 +104,9 @@ pub unsafe fn md5_mb4_block_neon(st: *mut [[u32; 4]; 4], ptrs: &[&[u8]; 4]) {
 
 // ---------- 2-lane (md5x2): u32x2, lane = stream ----------
 
+// unused: the input hasher prefers scalar on aarch64 (serial MD5 gains
+// nothing from 2-lane SIMD); kept as reference/verification code
+#[allow(dead_code)]
 #[target_feature(enable = "neon")]
 pub unsafe fn md5_block_x2_neon(state: *mut u32, src0: *const u8, src1: *const u8) {
     let s0 = std::slice::from_raw_parts(src0, 64);

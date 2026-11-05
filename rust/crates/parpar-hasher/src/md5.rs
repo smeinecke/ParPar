@@ -1327,16 +1327,11 @@ impl Md5X2 {
                 file_data.as_ptr(),
             );
         }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            return crate::md5_neon::md5_block_x2_neon(
-                self.state.as_mut_ptr(),
-                block_data.as_ptr(),
-                file_data.as_ptr(),
-            );
-        }
         #[allow(unreachable_code)]
         {
+            // scalar on aarch64: the C++ port reaches the same conclusion
+            // (dedicated arm64 GPR asm, no NEON) - a serial MD5 chain gains
+            // nothing from 2-lane SIMD and pays for it in vector-op latency
             let (l0, l1) = self.state.split_at_mut(4);
             let l0: &mut [u32; 4] = l0.try_into().unwrap();
             let l1: &mut [u32; 4] = l1.try_into().unwrap();

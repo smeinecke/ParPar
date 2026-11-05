@@ -125,12 +125,12 @@ pub fn inhash_method_name() -> &'static str {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // NEON md5x2 is baseline; CRC half uses ARMv8 CRC instructions
-        // when present
+        // scalar MD5 on aarch64 (C++ parity: arm64 GPR asm beats NEON on
+        // the serial chain); CRC half uses ARMv8 CRC instructions
         return if crc32::arm_crc_available() {
-            "NEON+ARMCRC"
+            "Scalar+ARMCRC"
         } else {
-            "NEON+Generic"
+            "Scalar+Generic"
         };
     }
     #[allow(unreachable_code)]
