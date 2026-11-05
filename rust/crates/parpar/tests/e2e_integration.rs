@@ -74,7 +74,7 @@ fn generate_opts(
     o.gf_method = Some(gf_method);
     o.output_base = out_base.to_string_lossy().into_owned();
     o.output_overwrite = true;
-    o.creator = "ParPar v0.5.1 x64 [https://github.com/animetosho/parpar]".into();
+    o.creator = "ParPar v0.5.2 x64 [https://github.com/animetosho/parpar]".into();
     o.memory_limit = memory_limit;
     o.recovery_slices = vec![SpecTerm {
         unit: SpecUnit::Slices,
