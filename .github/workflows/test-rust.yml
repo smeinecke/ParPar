@@ -18,7 +18,7 @@ jobs:
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, ffi: '1' }
           # Other platforms exercise the pure-Rust crates only - the C++
           # oracle build (parpar-sys/cmake) is Linux-only for now
-          - { os: macos-14,       target: aarch64-apple-darwin, ffi: '' }
+          - { os: macos-15,              target: aarch64-apple-darwin, ffi: '' }
           - { os: macos-15-intel, target: x86_64-apple-darwin, ffi: '' }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, ffi: '' }
     name: cargo test (${{ matrix.os }})
@@ -218,7 +218,7 @@ jobs:
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
           # macOS both arches, Windows x86_64
           - { os: macos-15-intel,   target: x86_64-apple-darwin }
-          - { os: macos-14,         target: aarch64-apple-darwin }
+          - { os: macos-15,                target: aarch64-apple-darwin }
           - { os: windows-latest,   target: x86_64-pc-windows-msvc }
     name: binary (${{ matrix.target }})
     runs-on: ${{ matrix.os }}

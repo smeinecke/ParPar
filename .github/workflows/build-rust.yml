@@ -28,7 +28,7 @@ jobs:
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, slug: linux-glibc-arm64 }
           # macOS both arches, Windows x86_64
           - { os: macos-15-intel,   target: x86_64-apple-darwin,  slug: macos-amd64 }
-          - { os: macos-14,         target: aarch64-apple-darwin, slug: macos-arm64 }
+          - { os: macos-15,                target: aarch64-apple-darwin, slug: macos-arm64 }
           # 'windows-amd64' not 'win64': JS build.yml already owns '-win64.7z'
           - { os: windows-latest,   target: x86_64-pc-windows-msvc, slug: windows-amd64 }
     name: rust binary (${{ matrix.slug }})
