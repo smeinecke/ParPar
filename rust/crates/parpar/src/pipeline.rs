@@ -469,12 +469,17 @@ impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
         ));
 
         self.read_pass(chunk_size, first, cb_progress)?;
+        let perf = std::env::var_os("PARPAR_PERF").is_some();
+        let t0 = std::time::Instant::now();
         if first {
             self.init_output_files()?;
         }
         cb_progress(Progress::ChunkPassWrite(self.pass_num, self.pass_chunk_num));
         self.finish(first)?;
         self.write_files(cb_progress)?;
+        if perf {
+            eprintln!("[perf] write_files={:.2}s", t0.elapsed().as_secs_f64());
+        }
         cb_progress(Progress::ChunkPassComplete(
             self.pass_num,
             self.pass_chunk_num,
@@ -483,7 +488,11 @@ impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
         self.pass_chunk_num += 1;
         self.chunk_offset += chunk_size;
         if let Some(ch) = &mut self.chunker {
+            let t1 = std::time::Instant::now();
             ch.wait_recovery_complete().map_err(|e| e.to_string())?;
+            if perf {
+                eprintln!("[perf] wait_recovery={:.2}s", t1.elapsed().as_secs_f64());
+            }
         }
         Ok(())
     }
@@ -592,6 +601,7 @@ impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
             let chunk_offset = self.chunk_offset;
             let mut err: JsResult<()> = Ok(());
             {
+                let cb_pool = pool.clone();
                 let r = file_chunk_reader(
                     &files,
                     slice_size,
@@ -600,15 +610,17 @@ impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
                     &pool,
                     self.gen.opts.chunk_read_threads as usize,
                     self.chunk_read_throttle.as_ref(),
-                    |_file, fidx, data, slice_num| {
+                    |_file, fidx, buf, n, slice_num| {
                         // files[] mirrors gen.par2.files order, so the index
                         // identifies the Par2File even for duplicate names
                         cb_progress(Progress::ProcessingSlice(fidx, slice_num));
                         let off = self.gen.par2.files[fidx].slice_offset + slice_num;
                         let ch = self.chunker.as_mut().unwrap();
+                        let p = cb_pool.clone();
                         let r = ch.process_data(
                             off as i64,
-                            SliceBuf::new(data.to_vec().into_boxed_slice(), data.len()),
+                            SliceBuf::new(buf.into_boxed_slice(), n)
+                                .with_reclaim(move |v| p.put(v)),
                         );
                         if let Err(e) = r {
                             err = Err(e.to_string());

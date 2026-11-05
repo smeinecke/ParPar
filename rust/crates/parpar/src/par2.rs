@@ -1111,8 +1111,10 @@ impl<C: GfCtx> RecoveryGen<C> {
         if len == 0 || buf.data.is_empty() {
             return Ok(());
         }
-        // bufferSlice.call(dataSlice, 0, len) clamps to buffer length
-        buf.len = len.min(buf.data.len());
+        // bufferSlice.call(dataSlice, 0, len) clamps to the view length -
+        // buf.len is the caller's declared byte count; the storage may be
+        // a larger pooled buffer with stale bytes past len
+        buf.len = len.min(buf.len).min(buf.data.len());
         if !self.progress_set {
             if let Some(g) = self.gf.as_mut() {
                 g.set_progress(true)?;

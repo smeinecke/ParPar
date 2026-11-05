@@ -131,15 +131,21 @@ fn read_at(f: &File, buf: &mut [u8], pos: u64) -> std::io::Result<usize> {
 /// slice_num)` per chunk. Files iterated in order; zero-size / offset-past
 /// -size files skipped. Reads `chunkSize` at `sliceNum*sliceSize +
 /// chunkOffset`; the final slice may be short.
+/// Reads the `chunk_offset`-aligned `chunk_size` strip of every slice in
+/// file order. `concurrency` read workers (JS `chunkReadThreads`) pull
+/// work items and hand pooled buffers to the callback in-order; the
+/// callback owns each buffer and returns it to `pool` via the SliceBuf
+/// reclaim hook - zero copy like the JS `bufPool.put` binding.
+#[allow(clippy::too_many_arguments)]
 pub fn file_chunk_reader(
     files: &[FileInfo],
     slice_size: u64,
     chunk_size: u64,
     chunk_offset: u64,
     pool: &BufferPool,
-    _concurrency: usize,
+    concurrency: usize,
     throttle: Option<&ThrottleQueue>,
-    mut cb_chunk: impl FnMut(&FileInfo, usize, &[u8], u64),
+    mut cb_chunk: impl FnMut(&FileInfo, usize, Vec<u8>, usize, u64),
 ) -> JsResult<()> {
     let no_throttle;
     let throttle = match throttle {
@@ -149,10 +155,12 @@ pub fn file_chunk_reader(
             &no_throttle
         }
     };
-    let mut read_err: Option<String> = None;
-
+    // flat (file, slice) work list in delivery order
+    let mut work: Vec<(usize, u64, u64)> = Vec::new();
+    let mut fds: Vec<Option<File>> = Vec::with_capacity(files.len());
     for (fidx, file) in files.iter().enumerate() {
         if file.size == 0 || file.size <= chunk_offset {
+            fds.push(None);
             continue;
         }
         let fd = match File::open(file.fs_path()) {
@@ -161,34 +169,86 @@ pub fn file_chunk_reader(
         };
         let num_slices = (file.size - chunk_offset + slice_size - 1) / slice_size;
         for s in 0..num_slices {
-            if read_err.is_some() {
-                break;
-            }
-            let pos = s * slice_size + chunk_offset;
-            let (cancelled, _done) = throttle.pass(chunk_size as f64);
-            if cancelled {
-                continue; // JS `if(cancelled) return cb()` - skips the slice
-            }
-            let mut buf = pool.get();
-            match read_at(&fd, &mut buf[..chunk_size as usize], pos) {
-                Ok(n) => {
-                    let data = &buf[..n];
-                    // JS passes bufferSlice(0, bytesRead) - a view; we pass a
-                    // slice and return the buf to the pool after the callback
-                    cb_chunk(file, fidx, data, s);
-                    pool.put(buf);
+            work.push((fidx, s * slice_size + chunk_offset, s));
+        }
+        fds.push(Some(fd));
+    }
+    let nwork = work.len();
+    if nwork == 0 {
+        return Ok(());
+    }
+    let workers = concurrency.clamp(1, 32).min(nwork);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (tx, rx) = std::sync::mpsc::channel::<(
+        usize,
+        Result<(Vec<u8>, usize), String>,
+        bool,
+    )>();
+    let work = &work;
+    let fds = &fds;
+    std::thread::scope(|sc| {
+        for _ in 0..workers {
+            let next = &next;
+            let tx = tx.clone();
+            let throttle = &*throttle;
+            sc.spawn(move || loop {
+                let seq = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if seq >= nwork {
+                    break;
                 }
-                Err(e) => {
-                    pool.put(buf);
-                    read_err = Some(crate::compat::fs_io_error(&e, "read", &file.name));
+                let (fidx, pos, _s) = work[seq];
+                let fd = fds[fidx].as_ref().unwrap();
+                // JS throttles inside the read worker before fs.read
+                let (cancelled, _done) = throttle.pass(chunk_size as f64);
+                if cancelled {
+                    let _ = tx.send((seq, Err(String::new()), true));
+                    continue;
                 }
+                let mut buf = pool.get();
+                // the pooled buffer may exceed chunk_size; n is the real
+                // byte count and travels as SliceBuf.len (buffered_process
+                // clamps to it) so stale pool bytes past n stay invisible
+                let r = match read_at(fd, &mut buf[..chunk_size as usize], pos) {
+                    Ok(n) => Ok((buf, n)),
+                    Err(e) => {
+                        pool.put(buf);
+                        Err(crate::compat::fs_io_error(&e, "read", &files[fidx].name))
+                    }
+                };
+                let _ = tx.send((seq, r, false));
+            });
+        }
+        drop(tx);
+        // deliver in work order; out-of-order arrivals park in the map
+        let mut pend: std::collections::BTreeMap<
+            usize,
+            (Result<(Vec<u8>, usize), String>, bool),
+        > = std::collections::BTreeMap::new();
+        let mut want = 0usize;
+        let mut read_err: Option<String> = None;
+        for (seq, r, cancelled) in rx {
+            pend.insert(seq, (r, cancelled));
+            while let Some((r, cancelled)) = pend.remove(&want) {
+                match r {
+                    Ok((buf, n)) => {
+                        let (fidx, _pos, s) = work[want];
+                        cb_chunk(&files[fidx], fidx, buf, n, s);
+                    }
+                    Err(e) => {
+                        // cancelled slots carry an empty error and only skip
+                        if !cancelled && read_err.is_none() {
+                            read_err = Some(e);
+                        }
+                    }
+                }
+                want += 1;
             }
         }
-    }
-    if let Some(e) = read_err {
-        return Err(e);
-    }
-    Ok(())
+        if let Some(e) = read_err {
+            return Err(e);
+        }
+        Ok(())
+    })
 }
 
 /// `lib/fileseqreader.js` FileReaderData - a delivered read chunk.

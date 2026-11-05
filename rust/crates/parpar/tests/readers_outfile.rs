@@ -35,9 +35,13 @@ fn chunk_reader_enumerates_slices() {
     let files = mk_files(&dir, &[("a.bin", 10000), ("b.bin", 3), ("empty.bin", 0)]);
     let pool = BufferPool::new(vec![], 4096, 4);
     let mut got = Vec::new();
-    file_chunk_reader(&files, 4096, 4096, 0, &pool, 1, None, |f, _, d, s| {
-        got.push((f.name.clone(), d.len(), s));
-        assert!(d.iter().all(|&b| b == 7));
+    let cb_pool = pool.clone();
+    file_chunk_reader(&files, 4096, 4096, 0, &pool, 1, None, |f, _, d, n, s| {
+        got.push((f.name.clone(), n, s));
+        assert!(d[..n].iter().all(|&b| b == 7));
+        // the callback owns the pooled buffer - return it like the
+        // pipeline's SliceBuf reclaim does or the bounded pool starves
+        cb_pool.put(d);
     })
     .unwrap();
     // a: ceil(10000/4096)=3 slices; b: 1; empty skipped
@@ -48,8 +52,9 @@ fn chunk_reader_enumerates_slices() {
 
     // chunk_offset skips first bytes: file.size <= offset -> skipped
     let mut got2 = Vec::new();
-    file_chunk_reader(&files, 4096, 100, 500, &pool, 1, None, |f, _, d, s| {
-        got2.push((f.name.clone(), d.len(), s));
+    file_chunk_reader(&files, 4096, 100, 500, &pool, 1, None, |f, _, d, n, s| {
+        got2.push((f.name.clone(), n, s));
+        cb_pool.put(d);
     })
     .unwrap();
     // b.bin (3 < 500) skipped; a.bin ceil(9500/4096)=3

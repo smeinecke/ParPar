@@ -177,24 +177,29 @@ impl Worker {
             self.outputs_flat = new_flat;
         } else {
             let old = std::mem::take(&mut self.outputs_flat);
+            let mut new_flat = vec![0u8; need];
             if !old.is_empty() && self.out_tile > 0 && self.layout_len > 0 {
-                // tile granularity changed: migrate output by output
+                // migrate output by output: byte b of output o sits at
+                // (b/tile*nouts + o)*tile + b%tile in each layout, so the
+                // byte prefix copies through any tile/len/nouts change
                 let old_tile = self.out_tile;
                 let old_len = self.layout_len;
                 let old_nouts = self.exponents.len().max(1);
-                let mut new_flat = vec![0u8; need];
+                let keep = len.min(old_len);
                 for o in 0..old_nouts.min(nouts) {
-                    for r in 0..old_len.div_ceil(old_tile) {
-                        let tb = (old_len - r * old_tile).min(old_tile);
-                        let so = (r * old_nouts + o) * old_tile;
-                        let d = (r * nouts + o) * tile;
-                        new_flat[d..d + tb].copy_from_slice(&old[so..so + tb]);
+                    let mut b = 0usize;
+                    while b < keep {
+                        let n = (tile - b % tile)
+                            .min(old_tile - b % old_tile)
+                            .min(keep - b);
+                        let so = (b / old_tile * old_nouts + o) * old_tile + b % old_tile;
+                        let d = (b / tile * nouts + o) * tile + b % tile;
+                        new_flat[d..d + n].copy_from_slice(&old[so..so + n]);
+                        b += n;
                     }
                 }
-                self.outputs_flat = new_flat;
-            } else {
-                self.outputs_flat = vec![0u8; need];
             }
+            self.outputs_flat = new_flat;
         }
         self.out_tile = tile;
         self.layout_len = len;
@@ -403,14 +408,13 @@ impl Worker {
                         continue;
                     }
                     sc.spawn(move || {
-                        // the multiply is elastic background work: run the
-                        // workers nice'd so they absorb spare cycles instead
-                        // of oversubscribing cores against the pipeline's
-                        // serial feed (reader/hasher/consumer) chain
+                        // the multiply is elastic background work: workers
+                        // run nice(19) so they yield proportionally to the
+                        // pipeline's serial feed (reader/hasher/consumer)
+                        // under contention. SCHED_IDLE was tried and is
+                        // worse: it also defers to unrelated host load.
                         #[cfg(unix)]
                         unsafe {
-                            let p = libc::sched_param { sched_priority: 0 };
-                            libc::sched_setscheduler(0, libc::SCHED_IDLE, &p);
                             libc::setpriority(libc::PRIO_PROCESS, 0, 19);
                         }
                         work(group)
