@@ -342,7 +342,7 @@ fn run_case(
     o.gf_method = Some(MethodRef::Name("".into()));
     o.output_base = out_base;
     o.output_overwrite = true;
-    o.creator = "ParPar v0.5.2 x64 [https://github.com/animetosho/parpar]".into();
+    o.creator = "ParPar v0.5.3 x64 [https://github.com/animetosho/parpar]".into();
     configure(&mut o);
 
     let env = SysEnv {

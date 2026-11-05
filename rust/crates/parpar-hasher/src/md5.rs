@@ -1282,7 +1282,9 @@ fn x86_use_bmi1() -> bool {
     std::arch::is_x86_feature_detected!("bmi1")
 }
 
+#[cfg(target_arch = "x86_64")]
 md5_block_x2_impl!(md5_block_x2_asm, md5_rg4, md5_ri4, md5_ri4_last);
+#[cfg(target_arch = "x86_64")]
 md5_block_x2_impl!(
     md5_block_x2_asm_bmi1,
     md5_rg4_bmi1,
@@ -1533,6 +1535,7 @@ mod sse_tests {
 
 // ===== single-lane variants (lane-split hashing) =====
 
+#[cfg(target_arch = "x86_64")]
 macro_rules! md5_rf4_x1 {
     // 4 rounds, roles rotate (a,b,c,d)->(d,a,b,c)->(c,d,a,b)->(b,c,d,a)
     //
@@ -1588,6 +1591,7 @@ macro_rules! md5_rf4_x1 {
     };
 }
 
+#[cfg(target_arch = "x86_64")]
 macro_rules! md5_rg4_x1 {
     // 4 rounds, roles rotate (a,b,c,d)->(d,a,b,c)->(c,d,a,b)->(b,c,d,a)
     //
@@ -1651,6 +1655,7 @@ macro_rules! md5_rg4_x1 {
     };
 }
 
+#[cfg(target_arch = "x86_64")]
 macro_rules! md5_rh4_x1 {
     // 4 rounds, roles rotate (a,b,c,d)->(d,a,b,c)->(c,d,a,b)->(b,c,d,a)
     //
@@ -1702,6 +1707,7 @@ macro_rules! md5_rh4_x1 {
     };
 }
 
+#[cfg(target_arch = "x86_64")]
 macro_rules! md5_ri4_x1 {
     // 4 rounds, roles rotate (a,b,c,d)->(d,a,b,c)->(c,d,a,b)->(b,c,d,a)
     //
@@ -1757,6 +1763,7 @@ macro_rules! md5_ri4_x1 {
     };
 }
 
+#[cfg(target_arch = "x86_64")]
 macro_rules! md5_ri4_last_x1 {
     // 4 rounds, roles rotate (a,b,c,d)->(d,a,b,c)->(c,d,a,b)->(b,c,d,a)
     // last round has no message-word prefetch
@@ -1811,6 +1818,7 @@ macro_rules! md5_ri4_last_x1 {
     };
 }
 
+#[cfg(target_arch = "x86_64")]
 macro_rules! md5_rg4_bmi1_x1 {
     // BMI1 variant: andn replaces mov+not+and in the first G term
     ($a1:ident, $b1:ident, $c1:ident, $d1:ident, $p:ident,
@@ -1865,6 +1873,7 @@ macro_rules! md5_rg4_bmi1_x1 {
     };
 }
 
+#[cfg(target_arch = "x86_64")]
 macro_rules! md5_ri4_bmi1_x1 {
     // BMI1 variant: I(x,y,z)=y^(x|~z) evaluated as -( z^(~x&y) )-1 via andn+sub
     ($a1:ident, $b1:ident, $c1:ident, $d1:ident, $p:ident,
@@ -1911,6 +1920,7 @@ macro_rules! md5_ri4_bmi1_x1 {
     };
 }
 
+#[cfg(target_arch = "x86_64")]
 macro_rules! md5_ri4_last_bmi1_x1 {
     // BMI1 variant of md5_ri4_last - final round has no message prefetch
     ($a1:ident, $b1:ident, $c1:ident, $d1:ident, $p:ident,
@@ -2281,7 +2291,9 @@ macro_rules! md5_block_x1_impl {
     };
 }
 
+#[cfg(target_arch = "x86_64")]
 md5_block_x1_impl!(md5_block_x1_asm, md5_rg4_x1, md5_ri4_x1, md5_ri4_last_x1);
+#[cfg(target_arch = "x86_64")]
 md5_block_x1_impl!(
     md5_block_x1_asm_bmi1,
     md5_rg4_bmi1_x1,
