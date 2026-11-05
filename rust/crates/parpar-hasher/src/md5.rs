@@ -115,6 +115,118 @@ pub fn md5_process_block(state: &mut [u32; 4], block: &[u8]) {
     state[3] = od.wrapping_add(d);
 }
 
+/// Round constants as 32 u64 pairs: consecutive steps share one 64-bit
+/// value, letting codegen emit a single `ldp`/`lsr` pair (the C++ arm64
+/// asm trick) instead of mov+movk per constant.
+static MD5_KP: [u64; 32] = [
+    0xe8c7b756_d76aa478, 0xc1bdceee_242070db, 0x4787c62a_f57c0faf, 0xfd469501_a8304613,
+    0x8b44f7af_698098d8, 0x895cd7be_ffff5bb1, 0xfd987193_6b901122, 0x49b40821_a679438e,
+    0xc040b340_f61e2562, 0xe9b6c7aa_265e5a51, 0x02441453_d62f105d, 0xe7d3fbc8_d8a1e681,
+    0xc33707d6_21e1cde6, 0x455a14ed_f4d50d87, 0xfcefa3f8_a9e3e905, 0x8d2a4c8a_676f02d9,
+    0x8771f681_fffa3942, 0xfde5380c_6d9d6122, 0x4bdecfa9_a4beea44, 0xbebfbc70_f6bb4b60,
+    0xeaa127fa_289b7ec6, 0x04881d05_d4ef3085, 0xe6db99e5_d9d4d039, 0xc4ac5665_1fa27cf8,
+    0x432aff97_f4292244, 0xfc93a039_ab9423a7, 0x8f0ccc92_655b59c3, 0x85845dd1_ffeff47d,
+    0xfe2ce6e0_6fa87e4f, 0x4e0811a1_a3014314, 0xbd3af235_f7537e82, 0xeb86d391_2ad7d2bb,
+];
+
+/// Two blocks for two independent states, stepped in lockstep so the
+/// compiler can interleave the chains - each chain's serial rotate/add
+/// latency gets covered by the other's ops (the trick the C++ arm64 asm
+/// uses). Roughly 2x the throughput of two sequential blocks on wide
+/// scalar cores.
+pub fn md5_process_block_x2(
+    state0: &mut [u32; 4],
+    block0: &[u8],
+    state1: &mut [u32; 4],
+    block1: &[u8],
+) {
+    debug_assert_eq!(block0.len(), MD5_BLOCKSIZE);
+    debug_assert_eq!(block1.len(), MD5_BLOCKSIZE);
+    let mut x = [0u32; 16];
+    let mut y = [0u32; 16];
+    for (j, (w, v)) in x.iter_mut().zip(y.iter_mut()).enumerate() {
+        *w = u32::from_le_bytes(block0[j * 4..j * 4 + 4].try_into().unwrap());
+        *v = u32::from_le_bytes(block1[j * 4..j * 4 + 4].try_into().unwrap());
+    }
+    let (mut a, mut b, mut c, mut d) = (state0[0], state0[1], state0[2], state0[3]);
+    let (mut p, mut q, mut r, mut s) = (state1[0], state1[1], state1[2], state1[3]);
+    let (oa, ob, oc, od) = (a, b, c, d);
+    let (op, oq, or_, os) = (p, q, r, s);
+    // rp! = one pair of steps (both chains each): the constant pair is a
+    // u64 so codegen can use one load + lsr for both steps
+    macro_rules! rp {
+        ($f:ident, $a:ident, $b:ident, $c:ident, $d:ident,
+         $p:ident, $q:ident, $r2:ident, $s:ident,
+         $k0:expr, $k1:expr, $rot0:expr, $rot1:expr, $kp:expr) => {{
+            let kp: u64 = $kp;
+            $a = $a
+                .wrapping_add(kp as u32)
+                .wrapping_add($f($b, $c, $d))
+                .wrapping_add(x[$k0]);
+            $a = $a.rotate_left($rot0).wrapping_add($b);
+            $p = $p
+                .wrapping_add(kp as u32)
+                .wrapping_add($f($q, $r2, $s))
+                .wrapping_add(y[$k0]);
+            $p = $p.rotate_left($rot0).wrapping_add($q);
+            $d = $d
+                .wrapping_add((kp >> 32) as u32)
+                .wrapping_add($f($a, $b, $c))
+                .wrapping_add(x[$k1]);
+            $d = $d.rotate_left($rot1).wrapping_add($a);
+            $s = $s
+                .wrapping_add((kp >> 32) as u32)
+                .wrapping_add($f($p, $q, $r2))
+                .wrapping_add(y[$k1]);
+            $s = $s.rotate_left($rot1).wrapping_add($p);
+        }};
+    }
+    // Round 0 (F)
+    rp!(f, a, b, c, d, p, q, r, s, 0, 1, 7, 12, MD5_KP[0]);
+    rp!(f, c, d, a, b, r, s, p, q, 2, 3, 17, 22, MD5_KP[1]);
+    rp!(f, a, b, c, d, p, q, r, s, 4, 5, 7, 12, MD5_KP[2]);
+    rp!(f, c, d, a, b, r, s, p, q, 6, 7, 17, 22, MD5_KP[3]);
+    rp!(f, a, b, c, d, p, q, r, s, 8, 9, 7, 12, MD5_KP[4]);
+    rp!(f, c, d, a, b, r, s, p, q, 10, 11, 17, 22, MD5_KP[5]);
+    rp!(f, a, b, c, d, p, q, r, s, 12, 13, 7, 12, MD5_KP[6]);
+    rp!(f, c, d, a, b, r, s, p, q, 14, 15, 17, 22, MD5_KP[7]);
+    // Round 1 (G)
+    rp!(g, a, b, c, d, p, q, r, s, 1, 6, 5, 9, MD5_KP[8]);
+    rp!(g, c, d, a, b, r, s, p, q, 11, 0, 14, 20, MD5_KP[9]);
+    rp!(g, a, b, c, d, p, q, r, s, 5, 10, 5, 9, MD5_KP[10]);
+    rp!(g, c, d, a, b, r, s, p, q, 15, 4, 14, 20, MD5_KP[11]);
+    rp!(g, a, b, c, d, p, q, r, s, 9, 14, 5, 9, MD5_KP[12]);
+    rp!(g, c, d, a, b, r, s, p, q, 3, 8, 14, 20, MD5_KP[13]);
+    rp!(g, a, b, c, d, p, q, r, s, 13, 2, 5, 9, MD5_KP[14]);
+    rp!(g, c, d, a, b, r, s, p, q, 7, 12, 14, 20, MD5_KP[15]);
+    // Round 2 (H)
+    rp!(h, a, b, c, d, p, q, r, s, 5, 8, 4, 11, MD5_KP[16]);
+    rp!(h, c, d, a, b, r, s, p, q, 11, 14, 16, 23, MD5_KP[17]);
+    rp!(h, a, b, c, d, p, q, r, s, 1, 4, 4, 11, MD5_KP[18]);
+    rp!(h, c, d, a, b, r, s, p, q, 7, 10, 16, 23, MD5_KP[19]);
+    rp!(h, a, b, c, d, p, q, r, s, 13, 0, 4, 11, MD5_KP[20]);
+    rp!(h, c, d, a, b, r, s, p, q, 3, 6, 16, 23, MD5_KP[21]);
+    rp!(h, a, b, c, d, p, q, r, s, 9, 12, 4, 11, MD5_KP[22]);
+    rp!(h, c, d, a, b, r, s, p, q, 15, 2, 16, 23, MD5_KP[23]);
+    // Round 3 (I)
+    rp!(i, a, b, c, d, p, q, r, s, 0, 7, 6, 10, MD5_KP[24]);
+    rp!(i, c, d, a, b, r, s, p, q, 14, 5, 15, 21, MD5_KP[25]);
+    rp!(i, a, b, c, d, p, q, r, s, 12, 3, 6, 10, MD5_KP[26]);
+    rp!(i, c, d, a, b, r, s, p, q, 10, 1, 15, 21, MD5_KP[27]);
+    rp!(i, a, b, c, d, p, q, r, s, 8, 15, 6, 10, MD5_KP[28]);
+    rp!(i, c, d, a, b, r, s, p, q, 6, 13, 15, 21, MD5_KP[29]);
+    rp!(i, a, b, c, d, p, q, r, s, 4, 11, 6, 10, MD5_KP[30]);
+    rp!(i, c, d, a, b, r, s, p, q, 2, 9, 15, 21, MD5_KP[31]);
+    state0[0] = oa.wrapping_add(a);
+    state0[1] = ob.wrapping_add(b);
+    state0[2] = oc.wrapping_add(c);
+    state0[3] = od.wrapping_add(d);
+    state1[0] = op.wrapping_add(p);
+    state1[1] = oq.wrapping_add(q);
+    state1[2] = or_.wrapping_add(r);
+    state1[3] = os.wrapping_add(s);
+}
+
 #[cfg(target_arch = "x86_64")]
 macro_rules! md5_rf4 {
     // 4 rounds, roles rotate (a,b,c,d)->(d,a,b,c)->(c,d,a,b)->(b,c,d,a)
@@ -1331,12 +1443,12 @@ impl Md5X2 {
         {
             // scalar on aarch64: the C++ port reaches the same conclusion
             // (dedicated arm64 GPR asm, no NEON) - a serial MD5 chain gains
-            // nothing from 2-lane SIMD and pays for it in vector-op latency
+            // nothing from 2-lane SIMD and pays for it in vector-op latency.
+            // Interleaved lockstep version recovers most of the asm's ILP.
             let (l0, l1) = self.state.split_at_mut(4);
             let l0: &mut [u32; 4] = l0.try_into().unwrap();
             let l1: &mut [u32; 4] = l1.try_into().unwrap();
-            md5_process_block(l0, &block_data[..MD5_BLOCKSIZE]);
-            md5_process_block(l1, &file_data[..MD5_BLOCKSIZE]);
+            md5_process_block_x2(l0, &block_data[..MD5_BLOCKSIZE], l1, &file_data[..MD5_BLOCKSIZE]);
         }
     }
     /// md5_extract_x2(dst, state, idx)
@@ -2295,6 +2407,36 @@ md5_block_x1_impl!(
     md5_ri4_bmi1_x1,
     md5_ri4_last_bmi1_x1
 );
+
+#[cfg(test)]
+mod x2_tests {
+    use super::*;
+    #[test]
+    fn x2_matches_scalar() {
+        let mut d0 = vec![0u8; 64 * 37];
+        let mut d1 = vec![0u8; 64 * 37];
+        for (i, b) in d0.iter_mut().enumerate() {
+            *b = (i as u32).wrapping_mul(2654435761) as u8;
+        }
+        for (i, b) in d1.iter_mut().enumerate() {
+            *b = (i as u32).wrapping_mul(2246822519) as u8;
+        }
+        let init = [0x67452301u32, 0xefcdab89, 0x98badcfe, 0x10325476];
+        let mut s0 = init;
+        let mut s1 = [0x10325476u32, 0x98badcfe, 0xefcdab89, 0x67452301];
+        for (b0, b1) in d0.chunks_exact(64).zip(d1.chunks_exact(64)) {
+            md5_process_block_x2(&mut s0, b0, &mut s1, b1);
+        }
+        let mut r0 = init;
+        let mut r1 = [0x10325476u32, 0x98badcfe, 0xefcdab89, 0x67452301];
+        for (b0, b1) in d0.chunks_exact(64).zip(d1.chunks_exact(64)) {
+            md5_process_block(&mut r0, b0);
+            md5_process_block(&mut r1, b1);
+        }
+        assert_eq!(s0, r0);
+        assert_eq!(s1, r1);
+    }
+}
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod x1_tests {
