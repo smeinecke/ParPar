@@ -289,7 +289,17 @@ pub fn node_fs_error(
 /// errno -> Node's (code, description) - libuv `uv_strerror` texts.
 /// `io::Error` -> Node inspect-format error for a syscall+path.
 pub fn fs_io_error(e: &std::io::Error, syscall: &str, path: &str) -> String {
-    let errno = e.raw_os_error().unwrap_or(5);
+    // kind() normalizes the common cases cross-platform like libuv's
+    // uv_translate_sys_error: on unix raw_os_error is already an errno so
+    // nothing changes; on windows ERROR_FILE_EXISTS (80) is AlreadyExists
+    // -> EEXIST rather than falling through to EIO
+    let errno = match e.kind() {
+        std::io::ErrorKind::NotFound => 2,
+        std::io::ErrorKind::PermissionDenied => 13,
+        std::io::ErrorKind::AlreadyExists => 17,
+        std::io::ErrorKind::InvalidInput => 22,
+        _ => e.raw_os_error().unwrap_or(5),
+    };
     let (code, desc) = errno_info(errno);
     node_fs_error(-errno, code, desc, syscall, Some(path))
 }
