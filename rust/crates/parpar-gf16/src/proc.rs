@@ -760,17 +760,24 @@ impl NativeGfProc {
                     } => {
                         // outputs can be empty after FreeMem even though the
                         // caller-side index bound (outputs_count) still passes
-                        let have = index < w.exponents.len() && !w.outputs_flat.is_empty();
-                        let valid = if have && index < w.output_cksum.len() {
+                        let configured =
+                            index < w.exponents.len() && !w.outputs_flat.is_empty();
+                        // a round with no input flush leaves stale data in
+                        // outputs_flat (chunk passes only feed slices with
+                        // real bytes) - its recovery data is definitionally
+                        // zero, matching the composite's !has_added fill; the
+                        // proc is still valid so the checksum flag stays true
+                        let live = configured && w.processing_add;
+                        let valid = if live && index < w.output_cksum.len() {
                             let plen = w.aligned_size(&*w_kernel);
                             let g = w.gather_output(index);
                             cksum_update(0, &g[..plen.min(g.len())]) == w.output_cksum[index]
                         } else {
-                            have
+                            configured
                         };
                         let n = w.current_slice_size as usize;
                         let avail = n.min(out.data.len());
-                        if have {
+                        if live {
                             let src = w.gather_output(index);
                             w_kernel.finish(&mut out.data[..avail], &src);
                             out.len = avail;
@@ -1230,6 +1237,64 @@ mod tests {
                 2
             )
             .is_err());
+    }
+
+    /// Chunked generation only feeds inputs with real bytes; a chunk pass
+    /// where every file ends before chunk_offset sees no adds at all. Its
+    /// outputs must read as zeros - outputs_flat still holds the previous
+    /// pass's accumulation, and returning it rewrites pass-0 data at the
+    /// new chunk offset (JS oracle caught this as stale recovery data).
+    #[test]
+    fn empty_round_output_is_zero() {
+        let q: EventQueues = Default::default();
+        let cpu = CpuSpec {
+            method: 0,
+            input_batchsize: 1,
+            input_minbatchsize: 1,
+            chunk_size: 0,
+            slice_offset: 0,
+            slice_size: 0,
+        };
+        let mut p = NativeGfProc::new(0, q.clone(), 64, Some(&cpu), 2).unwrap();
+        p.set_recovery_slices(None, 2).unwrap();
+        let mut drain = |p: &NativeGfProc| {
+            while let Some(e) = p.wait_own_event(Duration::from_millis(50)) {
+                if matches!(e, ProcEvent::Ended { .. }) {
+                    break;
+                }
+            }
+        };
+        // round 1: real input, output must be nonzero
+        p.add_input(SliceBuf::new(vec![7u8; 64].into_boxed_slice(), 64), 0, 1)
+            .unwrap();
+        p.end_input(2).unwrap();
+        drain(&p);
+        let out = SliceBuf::new(vec![0u8; 64].into_boxed_slice(), 64);
+        p.get_output(0, out, 3).unwrap();
+        let mut nonzero = false;
+        while let Some(e) = p.wait_own_event(Duration::from_millis(50)) {
+            if let ProcEvent::OutputDone { buf, cksum_valid, .. } = e {
+                assert!(buf.data.iter().any(|&b| b != 0));
+                assert!(cksum_valid);
+                nonzero = true;
+                break;
+            }
+        }
+        assert!(nonzero, "first round produced no output event");
+        // round 2: end with no adds -> outputs must read as zeros, still
+        // checksum-valid (empty pass is not corruption)
+        p.end_input(4).unwrap();
+        drain(&p);
+        let out = SliceBuf::new(vec![0u8; 64].into_boxed_slice(), 64);
+        p.get_output(0, out, 5).unwrap();
+        while let Some(e) = p.wait_own_event(Duration::from_millis(50)) {
+            if let ProcEvent::OutputDone { buf, cksum_valid, .. } = e {
+                assert!(buf.data.iter().all(|&b| b == 0));
+                assert!(cksum_valid);
+                return;
+            }
+        }
+        panic!("no output event for empty round");
     }
 
     /// get_output after free_mem must not panic - C++ returns a zeroed

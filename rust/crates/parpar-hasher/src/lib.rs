@@ -94,9 +94,12 @@ impl LaneProducer {
     }
 
     /// At EOF: emit the partial last slice's lane0 state (if any), then
-    /// finalise lane1 into the 16-byte file MD5.
+    /// finalise lane1 into the 16-byte file MD5. A partial slice exists
+    /// iff file_len % slice_size != 0 - slice_off alone undercounts: it
+    /// only tracks full 64-byte blocks, so a <64-byte tail would ship no
+    /// state and starve the consumer's get_block queue.
     pub fn finish(&mut self, states: &mut Vec<[u32; 4]>) -> [u8; 16] {
-        if self.slice_off > 0 {
+        if self.file_len % self.slice_size != 0 {
             states.push(self.x2.extract(HASH2X_BLOCK));
         }
         let mut st = self.x2.extract(HASH2X_FILE);
