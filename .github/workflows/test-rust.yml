@@ -47,6 +47,19 @@ jobs:
         if: matrix.ffi == ''
         run: cargo test -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl -p parpar-e2e-native
         working-directory: rust
+      # pure-Rust e2e on the pure build config: method/determinism/thread
+      # invariance, empty/tiny inputs, pipeline smoke. FFI differentials
+      # and JS parity tests gate themselves out on non-gnu/no-node.
+      - name: cargo test -p parpar --no-default-features (pure e2e)
+        if: matrix.ffi == ''
+        run: cargo test -p parpar --no-default-features
+        working-directory: rust
+      # release-mode run so the perf_gate throughput floors actually
+      # assert (debug builds skip them)
+      - name: cargo test --release (perf gates)
+        if: matrix.ffi == ''
+        run: cargo test --release -p parpar-hasher -p parpar-gf16 --test perf_gate
+        working-directory: rust
       - name: cargo build --no-default-features
         if: matrix.ffi == ''
         run: cargo build --release --no-default-features -p parpar
@@ -64,9 +77,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      # gnu dev-deps build the C++ oracle (parpar-sys) which needs libuv
-      - run: sudo apt-get update && sudo apt-get install -y libuv1-dev par2
+      # par2 = the independent verifier (par2cmdline e2e tests)
+      - run: sudo apt-get update && sudo apt-get install -y par2
       - run: cargo test -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl -p parpar-e2e-native
+        working-directory: rust
+      # pure e2e on real ARM: NEON method invariance + par2cmdline repair
+      - run: cargo test -p parpar --no-default-features
+        working-directory: rust
+      # release run so perf_gate throughput floors assert on real NEON
+      - run: cargo test --release -p parpar-hasher -p parpar-gf16 --test perf_gate
         working-directory: rust
       - run: cargo build --release --no-default-features -p parpar
         working-directory: rust
@@ -139,6 +158,9 @@ jobs:
     name: cargo test (qemu cross-arch)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # TCG emulation cannot meet any meaningful throughput floor
+    env:
+      PARPAR_PERF: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -163,8 +185,17 @@ jobs:
           /tmp/qemu-user/root/usr/bin/qemu-aarch64 target/aarch64-unknown-linux-musl/release/parpar -q -s256K -r4 -o /tmp/qarm.par2 /tmp/qin.bin
           test -f /tmp/qarm.par2
         working-directory: rust
+      # in-process pure e2e under TCG: method invariance over the NEON
+      # kernels, determinism, empty/tiny inputs (CLI/par2/node tests
+      # self-skip). Perf gates are off via PARPAR_PERF=0.
+      - name: aarch64 parpar e2e
+        run: cargo test --target aarch64-unknown-linux-musl -p parpar --no-default-features
+        working-directory: rust
       - name: riscv64 scalar tests
         run: cargo test --target riscv64gc-unknown-linux-musl -p parpar-hasher -p parpar-gf16 -p parpar-backend -p parpar-ocl -p parpar-e2e-native
+        working-directory: rust
+      - name: riscv64 parpar e2e
+        run: cargo test --target riscv64gc-unknown-linux-musl -p parpar --no-default-features
         working-directory: rust
 
   # AVX512/VBMI/GFNI kernel coverage under Intel SDE (-spr model emulates

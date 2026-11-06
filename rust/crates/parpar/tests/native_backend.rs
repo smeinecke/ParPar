@@ -1,4 +1,4 @@
-#![cfg(target_env = "gnu")]
+#![cfg(all(target_env = "gnu", target_arch = "x86_64"))]
 use parpar::native_backend::NativeBackend;
 use parpar_backend::ComputeBackend;
 use parpar_ffi::FfiBackend;

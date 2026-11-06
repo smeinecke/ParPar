@@ -2,7 +2,7 @@
 //! packet MD5s vs the JS reference (`test/dump_recdata.js` ->
 //! `rust/fixtures/recdata.json`), driven through the FFI backend.
 
-#![cfg(target_env = "gnu")]
+#![cfg(all(target_env = "gnu", target_arch = "x86_64"))]
 use parpar::par2::*;
 use parpar_backend::{CpuSpec, SliceBuf};
 use parpar_ffi::FfiBackend;

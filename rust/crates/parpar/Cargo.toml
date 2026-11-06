@@ -24,9 +24,9 @@ parpar-ocl = { path = "../parpar-ocl" }
 parpar-hasher = { path = "../parpar-hasher" }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 
-[target.'cfg(target_env = "gnu")'.dev-dependencies]
+[target.'cfg(all(target_env = "gnu", target_arch = "x86_64"))'.dev-dependencies]
 # differential tests use the reference backend as oracle regardless of the
-# production `ffi` feature; the oracle only links on gnu targets
+# production `ffi` feature; the oracle only links on x86_64-gnu targets
 parpar-ffi = { path = "../parpar-ffi" }
 
 [[bin]]

@@ -2,7 +2,7 @@
 //! Feeds identical byte streams through both HasherInput/HasherOutput
 //! implementations and requires identical records + digests.
 
-#![cfg(target_env = "gnu")]
+#![cfg(all(target_env = "gnu", target_arch = "x86_64"))]
 use parpar_backend::{ComputeBackend, HasherInput, HasherOutput};
 use parpar_ffi::FfiBackend;
 

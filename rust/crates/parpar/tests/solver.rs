@@ -2,7 +2,7 @@
 //! Cases: fixtures/gen/cases.json. Oracles: fixtures/gen/<i>_<id>.json
 //! produced by test/dump_gen.js (real binding + real OpenCL hardware).
 
-#![cfg(target_env = "gnu")]
+#![cfg(all(target_env = "gnu", target_arch = "x86_64"))]
 use parpar::args::{SpecExpr, SpecTerm, SpecUnit};
 use parpar::cliparse::{ThrottleMode, ThrottleSpec};
 use parpar::fileinfo::FileInfo;
