@@ -19,8 +19,14 @@ fn js_cli() -> Option<std::path::PathBuf> {
             return Some(p);
         }
     }
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bin/parpar.js");
-    p.exists().then_some(p)
+    // the JS CLI also needs the compiled addon - without it parpar.js
+    // dies on MODULE_NOT_FOUND instead of behaving like the oracle, so
+    // parity tests must skip rather than compare a crash trace
+    // CARGO_MANIFEST_DIR = rust/crates/parpar -> repo root is ../../..
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let p = root.join("bin/parpar.js");
+    let addon = root.join("build/Release/parpar_gf.node");
+    (p.exists() && addon.exists()).then_some(p)
 }
 
 /// Run the oracle generator over `args`/`files` -> `out.par2`; tries
