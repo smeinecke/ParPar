@@ -72,6 +72,8 @@ pub struct GenDriver<'a, C: GfCtx> {
     pub chunk_read_throttle: Option<ThrottleQueue>,
     /// JS `par2.recHashPtr` - cycles through chunked recovery headers
     pub rec_hash_ptr: usize,
+    /// background writer - JS's async fs.write/writev equivalent
+    pub write_queue: crate::outfile::WriteQueue,
 }
 
 impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
@@ -115,6 +117,7 @@ impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
             rec_hash_ptr: 0,
             seq_read_throttle: seq_thr.as_ref().and_then(ThrottleQueue::from_spec),
             chunk_read_throttle: chunk_thr.as_ref().and_then(ThrottleQueue::from_spec),
+            write_queue: crate::outfile::WriteQueue::new(),
         })
     }
 
@@ -351,7 +354,12 @@ impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
             self.out_files[rfi].open(overwrite)?;
             let pos = cpos + self.out_files[rfi].packets[pkt_i].data_chunk_offset;
             cb_progress(Progress::WritingFilePos(rfi, pos));
-            self.out_files[rfi].write_packets(pkt_i, cpos)?;
+            // surface deferred worker errors early like JS's write
+            // callbacks, then queue this packet group - the pull loop
+            // continues while the worker does the syscalls
+            self.write_queue.check()?;
+            let (job, _n) = self.out_files[rfi].take_write_job(pkt_i, cpos)?;
+            self.write_queue.submit(job)?;
             if let Some(i) = rec_idx {
                 self.release_recovery(i)?;
             }
@@ -383,6 +391,9 @@ impl<'a, C: GfCtx + Clone> GenDriver<'a, C> {
 
     /// JS `closeFiles`.
     fn close_files(&mut self) -> JsResult<()> {
+        // all queued writes must land before fsync/close so output_sync
+        // actually covers them
+        self.write_queue.drain()?;
         let sync = self.gen.opts.output_sync;
         for rf in &mut self.out_files {
             rf.close(sync)?;
