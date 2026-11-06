@@ -79,9 +79,9 @@ pub fn md5_block_asm(state: &mut [u32; 4], data: &[u8]) {
             a = inout(reg) a, b = inout(reg) b, c = inout(reg) c, d = inout(reg) d,
             t2 = out(reg) _,
             k0 = out(reg) k0, k1 = out(reg) k1,
-            c0 = lateout(reg) cache[0], c1 = lateout(reg) cache[1],
-            c2 = lateout(reg) cache[2], c3 = lateout(reg) cache[3],
-            c4 = lateout(reg) cache[4], c5 = lateout(reg) cache[5],
+            c0 = out(reg) cache[0], c1 = out(reg) cache[1],
+            c2 = out(reg) cache[2], c3 = out(reg) cache[3],
+            c4 = out(reg) cache[4], c5 = out(reg) cache[5],
             inp = in(reg) inp, kM = in(reg) kptr,
         );
         // ---- RF4(4,5,6,7,8,9,32): rounds 4-7
@@ -126,8 +126,8 @@ pub fn md5_block_asm(state: &mut [u32; 4], data: &[u8]) {
             a = inout(reg) a, b = inout(reg) b, c = inout(reg) c, d = inout(reg) d,
             t2 = out(reg) _,
             k0 = inout(reg) k0, k1 = inout(reg) k1,
-            c6 = lateout(reg) cache[6], c7 = lateout(reg) cache[7],
-            c8 = lateout(reg) cache[8], c9 = lateout(reg) cache[9],
+            c6 = out(reg) cache[6], c7 = out(reg) cache[7],
+            c8 = out(reg) cache[8], c9 = out(reg) cache[9],
             inp = in(reg) inp, kM = in(reg) kptr,
             c4 = in(reg) cache[4], c5 = in(reg) cache[5],
         );
@@ -173,8 +173,8 @@ pub fn md5_block_asm(state: &mut [u32; 4], data: &[u8]) {
             a = inout(reg) a, b = inout(reg) b, c = inout(reg) c, d = inout(reg) d,
             t2 = out(reg) _,
             k0 = inout(reg) k0, k1 = inout(reg) k1,
-            c10 = lateout(reg) cache[10], c11 = lateout(reg) cache[11],
-            c12 = lateout(reg) cache[12], c13 = lateout(reg) cache[13],
+            c10 = out(reg) cache[10], c11 = out(reg) cache[11],
+            c12 = out(reg) cache[12], c13 = out(reg) cache[13],
             inp = in(reg) inp, kM = in(reg) kptr,
             c8 = in(reg) cache[8], c9 = in(reg) cache[9],
         );
@@ -221,7 +221,7 @@ pub fn md5_block_asm(state: &mut [u32; 4], data: &[u8]) {
             a = inout(reg) a, b = inout(reg) b, c = inout(reg) c, d = inout(reg) d,
             t2 = out(reg) _,
             k0 = inout(reg) k0, k1 = inout(reg) k1,
-            c14 = lateout(reg) cache[14], c15 = lateout(reg) cache[15],
+            c14 = out(reg) cache[14], c15 = out(reg) cache[15],
             inp = in(reg) inp, kM = in(reg) kptr,
             c12 = in(reg) cache[12], c13 = in(reg) cache[13],
             c1 = in(reg) cache[1],
