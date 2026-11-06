@@ -119,6 +119,17 @@ struct Worker {
     output_cksum: Vec<u64>,
     processing_add: bool,
     batch: Vec<StagedInput>,
+    /// block-interleaved staging rebuilt per flush for packed kernels
+    /// (C++ prepare_packed INTERLEAVE_INPUTS layout), split into one
+    /// allocation per worker thread's round range - separate address
+    /// regions spread L3 home nodes so multiply reads don't funnel
+    /// through a single buffer's homes (measured ~40% aggregate win on
+    /// shared-line-heavy cores); reused across batches
+    packed_stages: Vec<Vec<u8>>,
+    /// round -> packed_stages index, and the round's local index inside
+    /// that buffer (rounds are contiguous per buffer)
+    packed_round_buf: Vec<usize>,
+    packed_round_local: Vec<usize>,
     needs_discard: bool,
     stat_batches: u32,
     slice_size: u64,
@@ -328,6 +339,10 @@ impl Worker {
         // layout) instead of jumping between per-output regions
         let nrounds = len.div_ceil(tile_len.max(1));
         let mut tasks: Vec<(usize, usize, usize, &mut [u8])> = Vec::with_capacity(nrounds * nouts);
+        // packpf bound: prefetch targets must stay inside the flat buffer
+        // (captured before the mutable chunks_mut borrow below)
+        let flat_end =
+            self.outputs_flat.as_ptr().wrapping_add(self.outputs_flat.len()) as usize;
         if nouts > 0 {
             let mut round_iters: Vec<std::slice::ChunksMut<u8>> = self
                 .outputs_flat
@@ -344,14 +359,146 @@ impl Worker {
         }
         let ntasks = tasks.len();
         let coeffs = &coeffs;
-        let packed_inputs: Vec<&[u8]> = staged.iter().map(|i| &i.packed[..]).collect();
+        let ninputs = staged.len();
+        // PARPAR_NO_PACKED: escape hatch to A/B the interleaved-staging
+        // path against plain per-input runs on production workloads
+        static NO_PACKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let no_packed = *NO_PACKED.get_or_init(|| std::env::var_os("PARPAR_NO_PACKED").is_some());
+        let use_packed = kernel_ref.supports_packed() && ninputs > 1 && !no_packed;
+        // output-major coeff rows for the packed path (C++
+        // `vals = coeffs + out*inputGrouping`): one contiguous u16 row
+        // per output - no per-task pointer chasing
+        let mut coeffs_flat: Vec<u16> = Vec::new();
+        if use_packed {
+            coeffs_flat.reserve(nouts * ninputs);
+            for o in 0..nouts {
+                for c in coeffs.iter() {
+                    coeffs_flat.push(c.get(o).copied().unwrap_or(0));
+                }
+            }
+        }
+        let coeffs_flat = &coeffs_flat;
+        // packed path (C++ INTERLEAVE_INPUTS): for kernels that can read
+        // block-interleaved staging, input k of each 8-input group gets
+        // its block j at stage[g*8*len + ng*32*j + 32k] - the fused
+        // muladd then walks one sequential src stream per group instead
+        // of 8 separate ones. Short inputs leave zeroed slots (c*0 = 0).
+        let ngroups = ninputs.div_ceil(8);
+        if use_packed {
+            let blk = kernel_ref.block_len();
+            // chunk-major layout (C++ srcPtr = input + round*chunkSize*
+            // inputGrouping): [round][group][8-interleaved blocks] so a
+            // task's whole src window per round is one contiguous span.
+            // Rounds partition contiguously across nthreads buffers -
+            // separate allocations spread L3 home-node traffic
+            let blocks_per_tile = tile_len / blk;
+            let nrounds_p = len.div_ceil(tile_len);
+            self.packed_round_buf.clear();
+            self.packed_round_buf.resize(nrounds_p, 0);
+            self.packed_round_local.clear();
+            self.packed_round_local.resize(nrounds_p, 0);
+            self.packed_stages.truncate(nthreads.max(1));
+            while self.packed_stages.len() < nthreads.max(1) {
+                self.packed_stages.push(Vec::new());
+            }
+            for b in 0..self.packed_stages.len() {
+                let r_lo = b * nrounds_p / self.packed_stages.len();
+                let r_hi = (b + 1) * nrounds_p / self.packed_stages.len();
+                let need = (r_hi - r_lo) * ninputs * tile_len;
+                if self.packed_stages[b].len() < need {
+                    self.packed_stages[b].resize(need, 0);
+                }
+                for r in r_lo..r_hi {
+                    self.packed_round_buf[r] = b;
+                    self.packed_round_local[r] = r - r_lo;
+                }
+            }
+            for (i, inp) in staged.iter().enumerate() {
+                let g = i / 8;
+                let ng = (ninputs - g * 8).min(8);
+                let plen = inp.packed.len().min(len);
+                let kbase = g * 8 * tile_len + blk * (i % 8);
+                let mut j = 0;
+                for chunk in inp.packed[..plen].chunks(blk) {
+                    let r = j / blocks_per_tile;
+                    let b = self.packed_round_buf[r];
+                    let off = self.packed_round_local[r] * ninputs * tile_len
+                        + kbase
+                        + ng * blk * (j % blocks_per_tile);
+                    self.packed_stages[b][off..off + chunk.len()].copy_from_slice(chunk);
+                    self.packed_stages[b][off + chunk.len()..off + blk].fill(0);
+                    j += 1;
+                }
+                // a staged input may be shorter than the slice (grew after
+                // staging or a partial tail slice) - zero its interleaved
+                // tail so it contributes c*0 = 0 instead of stale data
+                for j in (plen + blk - 1) / blk..len / blk {
+                    let r = j / blocks_per_tile;
+                    let b = self.packed_round_buf[r];
+                    let off = self.packed_round_local[r] * ninputs * tile_len
+                        + kbase
+                        + ng * blk * (j % blocks_per_tile);
+                    self.packed_stages[b][off..off + blk].fill(0);
+                }
+            }
+        }
+        let stages = &self.packed_stages;
+        let round_buf = &self.packed_round_buf;
+        let round_local = &self.packed_round_local;
+        let packed_inputs: Vec<&[u8]> = if use_packed {
+            Vec::new()
+        } else {
+            staged.iter().map(|i| &i.packed[..]).collect()
+        };
         let work = |group: Vec<(usize, usize, usize, &mut [u8])>| {
             for (toff, tl, o, dst) in group {
-                // general-coefficient inputs are accumulated two at a time
-                // (C++ procRegions=2): a fused muladd2 does one dst
-                // load/store per pair. XOR accumulation commutes, so a
-                // pending single pairs with the next general input
-                let mut pending: Option<(&[u8], u16)> = None;
+                // general-coefficient inputs are accumulated in runs of up
+                // to 8 same-length sources (C++ procRegions /
+                // CLMUL_NUM_REGIONS): a fused muladd_multi does one dst
+                // sweep - and for clmul one reduction - per run. XOR
+                // accumulation commutes, so runs only break on a length
+                // change or the first-mul overwrite; coeff 0/1 keep their
+                // cheap dedicated paths without flushing
+                let mut run: Vec<(&[u8], u16)> = Vec::with_capacity(8);
+                // packpf: the first run of each task prefetches the next
+                // output tile - tiles are tile_len-strided in the flat
+                // layout (dst[..tl] may be a short tail), so the next
+                // output's tile is always at dst+tile_len; kernels
+                // without prefetch ignore it
+                let mut pf = dst.as_ptr().wrapping_add(tile_len);
+                if (pf as usize) >= flat_end {
+                    pf = std::ptr::null();
+                }
+                let mut flush = |run: &mut Vec<(&[u8], u16)>, dst: &mut [u8]| {
+                    kernel_ref.muladd_multi_pf(dst, run, pf);
+                    pf = std::ptr::null();
+                    run.clear();
+                };
+                if use_packed {
+                    // interleaved staging already encodes the groups;
+                    // coeff-0/1 members multiply like the rest (C++ pays
+                    // the same) and coeff gaps read as 0
+                    if first_mul {
+                        dst.fill(0);
+                    }
+                    let r = toff / tile_len;
+                    let buf = &stages[round_buf[r]];
+                    let round_base = round_local[r] * ninputs * tile_len;
+                    let vals = &coeffs_flat[o * ninputs..o * ninputs + ninputs];
+                    for g in 0..ngroups {
+                        let ng = (ninputs - g * 8).min(8);
+                        let base = round_base + g * 8 * tile_len;
+                        kernel_ref.muladd_multi_packed_pf(
+                            dst,
+                            &buf[base..base + ng * tl],
+                            ng,
+                            &vals[g * 8..g * 8 + ng],
+                            pf,
+                        );
+                        pf = std::ptr::null();
+                    }
+                    continue;
+                }
                 for (i, packed) in packed_inputs.iter().enumerate() {
                     // a staged input may be shorter than tl if the slice
                     // size grew after staging - treat the missing region as
@@ -383,16 +530,17 @@ impl Worker {
                             dst[src.len()..].fill(0);
                         }
                         c => {
-                            if let Some((ps, pc)) = pending.take() {
-                                kernel_ref.muladd2(dst, ps, pc, src, c);
-                            } else {
-                                pending = Some((src, c));
+                            if run.len() == 8
+                                || run.first().is_some_and(|(s, _)| s.len() != src.len())
+                            {
+                                flush(&mut run, &mut *dst);
                             }
+                            run.push((src, c));
                         }
                     }
                 }
-                if let Some((ps, pc)) = pending {
-                    kernel_ref.muladd(dst, ps, pc);
+                if !run.is_empty() {
+                    flush(&mut run, dst);
                 }
             }
         };
@@ -549,6 +697,9 @@ impl NativeGfProc {
             output_cksum: Vec::new(),
             processing_add: false,
             batch: Vec::new(),
+            packed_stages: Vec::new(),
+            packed_round_buf: Vec::new(),
+            packed_round_local: Vec::new(),
             needs_discard: false,
             stat_batches: 0,
             slice_size: sz,
@@ -668,6 +819,9 @@ impl NativeGfProc {
                         w.layout_len = 0;
                         w.out_tile = 0;
                         w.output_cksum.clear();
+                        w.packed_stages = Vec::new();
+                        w.packed_round_buf = Vec::new();
+                        w.packed_round_local = Vec::new();
                     }
                     Cmd::Close => break,
                 }

@@ -42,6 +42,74 @@ pub trait GfKernel: Send + Sync {
         self.muladd(dst, src_a, coeff_a);
         self.muladd(dst, src_b, coeff_b);
     }
+    /// dst ^= sum_i(srcs_i * coeffs_i) over a packed region - C++
+    /// add_multi/procRegions: all inputs share one dst sweep (and kernels
+    /// may fuse further, e.g. clmul accumulates up to 8 srcs before a
+    /// single reduction). All srcs must have the same length; coeffs are
+    /// all >1 (callers route 0/1 separately). Default = muladd2 pairing.
+    fn muladd_multi(&self, dst: &mut [u8], inputs: &[(&[u8], u16)]) {
+        let mut it = inputs.iter();
+        loop {
+            match (it.next(), it.next()) {
+                (Some(&(sa, ca)), Some(&(sb, cb))) => self.muladd2(dst, sa, ca, sb, cb),
+                (Some(&(sa, ca)), None) => self.muladd(dst, sa, ca),
+                _ => break,
+            }
+        }
+    }
+    /// muladd_multi with an output-prefetch hint: `pf_dst` may point at
+    /// the dst region the caller will process next - kernels can issue
+    /// prefetches while accumulating so the next tile's write-allocate
+    /// misses overlap this sweep (C++ muladd_multi_packpf, pfFactor=0:
+    /// the first region group prefetches one tile). May be null.
+    fn muladd_multi_pf(&self, dst: &mut [u8], inputs: &[(&[u8], u16)], pf_dst: *const u8) {
+        let _ = pf_dst;
+        self.muladd_multi(dst, inputs);
+    }
+    /// Whether this kernel can consume block-interleaved input staging
+    /// (C++ prepare_packed INTERLEAVE_INPUTS): a group of up to
+    /// `interleave` inputs shares one contiguous region where input k's
+    /// block j sits at `32*(k + interleave*j)` bytes. Interleaving turns
+    /// the N src streams of a fused muladd into one sequential walk,
+    /// which is how C++ keeps the prefetcher ahead on multiply-bound
+    /// workloads.
+    fn supports_packed(&self) -> bool {
+        false
+    }
+    /// dst ^= sum_k(src_k * coeffs_k) where region is the interleaved
+    /// group: `interleave` inputs, src k's data over `len` output bytes
+    /// at `region[32*(k + interleave*j) ..]` per 32B block j.
+    /// `coeffs.len() == interleave`. Default decomposes per-src into a
+    /// scratch buffer - correct for any kernel; supported kernels
+    /// override with a fused stride read.
+    fn muladd_multi_packed(&self, dst: &mut [u8], region: &[u8], interleave: usize, coeffs: &[u16]) {
+        let block = 32;
+        let len = dst.len();
+        let mut scratch = vec![0u8; len];
+        for (k, &c) in coeffs.iter().enumerate().take(interleave) {
+            if c == 0 {
+                continue;
+            }
+            for (i, s) in scratch.iter_mut().enumerate() {
+                let b = i / block;
+                let off = i % block;
+                *s = region[32 * (k + interleave * b) + off];
+            }
+            self.muladd(dst, &scratch[..len], c);
+        }
+    }
+    /// muladd_multi_packed with the packpf dst-prefetch hint.
+    fn muladd_multi_packed_pf(
+        &self,
+        dst: &mut [u8],
+        region: &[u8],
+        interleave: usize,
+        coeffs: &[u16],
+        pf_dst: *const u8,
+    ) {
+        let _ = pf_dst;
+        self.muladd_multi_packed(dst, region, interleave, coeffs);
+    }
     /// dst = src * coeff (overwrite) over a packed region.
     fn mul(&self, dst: &mut [u8], src: &[u8], coeff: u16);
 }

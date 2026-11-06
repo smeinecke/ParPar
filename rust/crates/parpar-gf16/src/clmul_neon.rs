@@ -43,6 +43,7 @@ unsafe fn eor3q_u8(a: uint8x16_t, b: uint8x16_t, c: uint8x16_t) -> uint8x16_t {
 }
 
 /// Per-coefficient broadcast vectors: [c_lo, c_hi, c_lo^c_hi].
+#[derive(Clone, Copy)]
 pub(crate) struct Coeffs([poly8x16_t; 3]);
 
 #[inline]
@@ -137,6 +138,233 @@ pub(crate) unsafe fn muladd_block(dst: *mut u8, src: *const u8, c: &Coeffs, add:
     }
 }
 
+/// First-src round: fresh pmull accumulators for one 32B block.
+#[inline]
+#[target_feature(enable = "aes")]
+#[allow(clippy::type_complexity)]
+unsafe fn round1(
+    src: *const u8,
+    c: &Coeffs,
+) -> (
+    poly16x8_t,
+    poly16x8_t,
+    poly16x8_t,
+    poly16x8_t,
+    poly16x8_t,
+    poly16x8_t,
+) {
+    let data = vld2q_p8(src);
+    let mid = veorq_p8(data.0, data.1);
+    (
+        pmull_low(data.0, c.0[0]),
+        pmull_high(data.0, c.0[0]),
+        pmull_low(mid, c.0[2]),
+        pmull_high(mid, c.0[2]),
+        pmull_low(data.1, c.0[1]),
+        pmull_high(data.1, c.0[1]),
+    )
+}
+
+/// Accumulate-src round (pmacl): XOR the products into live accumulators.
+#[inline]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn round(
+    low1: &mut poly16x8_t,
+    low2: &mut poly16x8_t,
+    mid1: &mut poly16x8_t,
+    mid2: &mut poly16x8_t,
+    high1: &mut poly16x8_t,
+    high2: &mut poly16x8_t,
+    src: *const u8,
+    c: &Coeffs,
+) {
+    let data = vld2q_p8(src);
+    let mid = veorq_p8(data.0, data.1);
+    *low1 = veorq_p16(*low1, pmull_low(data.0, c.0[0]));
+    *low2 = veorq_p16(*low2, pmull_high(data.0, c.0[0]));
+    *mid1 = veorq_p16(*mid1, pmull_low(mid, c.0[2]));
+    *mid2 = veorq_p16(*mid2, pmull_high(mid, c.0[2]));
+    *high1 = veorq_p16(*high1, pmull_low(data.1, c.0[1]));
+    *high2 = veorq_p16(*high2, pmull_high(data.1, c.0[1]));
+}
+
+/// Fused multi-source muladd - port of C++ gf16_clmul_muladd_x with
+/// CLMUL_NUM_REGIONS=8: up to 8 srcs accumulate into one register set per
+/// 32B block, paying one Barrett reduction + one dst update for all of
+/// them (the reduction is GF(2)-linear so ordering is safe).
+/// `pf_dst` mirrors packpf's doPrefetch=1 path: while accumulating, one
+/// PRFM per 64B line pulls the *next* dst tile into cache so its
+/// write-allocate misses overlap this sweep. May be null.
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn muladd_multi_run(
+    dst: &mut [u8],
+    inputs: &[(&[u8], u16)],
+    pf_dst: *const u8,
+) {
+    let n = inputs.len().min(8);
+    debug_assert!(n > 0);
+    // vector region: every src must cover it; callers group equal lens so
+    // this is the full input length in practice
+    let len = inputs[..n]
+        .iter()
+        .map(|(s, _)| s.len())
+        .min()
+        .unwrap_or(0)
+        .min(dst.len());
+    let mut co = [Coeffs([vdupq_n_p8(0); 3]); 8];
+    for (k, &(_, c)) in inputs[..n].iter().enumerate() {
+        co[k] = make_coeffs(c);
+    }
+    let mut i = 0;
+    while i + BLK <= len {
+        // packpf: pull the next dst tile one 64B line per iteration
+        let pfa = pf_dst.wrapping_add(i);
+        if !pf_dst.is_null() && (pfa as usize) & 63 == 0 {
+            // PRFM PSTL1KEEP: prefetch-for-store, L1 - dst write target
+            // (std::arch::_prefetch is unstable on aarch64)
+            std::arch::asm!("prfm pstl1keep, [{p}]", p = in(reg) pfa, options(nostack));
+        }
+        let (mut low1, mut low2, mut mid1, mut mid2, mut high1, mut high2) =
+            round1(inputs[0].0.as_ptr().add(i), &co[0]);
+        // C++ `if(srcCount > k) gf16_clmul_neon_round(...)` guards: fixed
+        // indices keep each round inlined with constant coeff addressing;
+        // a runtime loop leaves the rounds rolled and the coeff table
+        // indexed
+        macro_rules! add_src {
+            ($s:literal) => {
+                if n > $s {
+                    round(
+                        &mut low1,
+                        &mut low2,
+                        &mut mid1,
+                        &mut mid2,
+                        &mut high1,
+                        &mut high2,
+                        inputs[$s].0.as_ptr().add(i),
+                        &co[$s],
+                    );
+                }
+            };
+        }
+        add_src!(1);
+        add_src!(2);
+        add_src!(3);
+        add_src!(4);
+        add_src!(5);
+        add_src!(6);
+        add_src!(7);
+        reduction(&mut low1, &mut low2, mid1, mid2, &mut high1, &mut high2);
+        let d = vld2q_u8(dst.as_mut_ptr().add(i));
+        vst2q_u8(
+            dst.as_mut_ptr().add(i),
+            uint8x16x2_t(
+                veorq_u8(d.0, vreinterpretq_u8_p16(veorq_p16(low1, low2))),
+                veorq_u8(d.1, vreinterpretq_u8_p16(veorq_p16(high1, high2))),
+            ),
+        );
+        i += BLK;
+    }
+    // scalar tail: each src covers only its own length beyond the vector
+    // region (defensive - grouped srcs share len)
+    for &(s, c) in &inputs[..n] {
+        let l = s.len().min(dst.len());
+        if i < l {
+            muladd_scalar(&mut dst[i..l], &s[i..l], c, true);
+        }
+    }
+}
+
+/// Interleaved-region variant of muladd_multi_run - the C++
+/// INTERLEAVE_INPUTS + srcScale layout: `interleave` inputs share one
+/// contiguous `interleave*len` region, src k's block j at
+/// `region[32*(k + interleave*j)]`. The fused call then walks a single
+/// sequential stream instead of `interleave` separate ones, which is
+/// what keeps the hardware prefetcher ahead on this core (the per-src
+/// version leaves measurable send-wait time on the table).
+/// `region.len() == interleave * dst.len()`; scalar tail slots are
+/// contiguous per src.
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn muladd_multi_packed_run(
+    dst: &mut [u8],
+    region: &[u8],
+    interleave: usize,
+    coeffs: &[u16],
+    pf_dst: *const u8,
+) {
+    let n = coeffs.len().min(interleave);
+    debug_assert!(n > 0);
+    debug_assert!(region.len() >= interleave * dst.len());
+    let len = dst.len();
+    let base = region.as_ptr();
+    let mut co = [Coeffs([vdupq_n_p8(0); 3]); 8];
+    for (k, &c) in coeffs[..n].iter().enumerate() {
+        co[k] = make_coeffs(c);
+    }
+    let mut i = 0;
+    while i + BLK <= len {
+        let pfa = pf_dst.wrapping_add(i);
+        if !pf_dst.is_null() && (pfa as usize) & 63 == 0 {
+            std::arch::asm!("prfm pstl1keep, [{p}]", p = in(reg) pfa, options(nostack));
+        }
+        // self-prefetch: keep ~1KB of the src stream in flight - the
+        // interleaved walk is sequential so one stream prefetch covers
+        // all inputs (matches what C++ gets from its layout on cores
+        // whose hw prefetcher lags); prfm never faults, no bound check
+        let pfs = base.add(interleave * i + 1024);
+        std::arch::asm!("prfm pldl1keep, [{p}]", p = in(reg) pfs, options(nostack));
+        let (mut low1, mut low2, mut mid1, mut mid2, mut high1, mut high2) =
+            round1(base.add(interleave * i), &co[0]);
+        macro_rules! add_src {
+            ($s:literal) => {
+                if n > $s {
+                    round(
+                        &mut low1,
+                        &mut low2,
+                        &mut mid1,
+                        &mut mid2,
+                        &mut high1,
+                        &mut high2,
+                        base.add(BLK * $s + interleave * i),
+                        &co[$s],
+                    );
+                }
+            };
+        }
+        add_src!(1);
+        add_src!(2);
+        add_src!(3);
+        add_src!(4);
+        add_src!(5);
+        add_src!(6);
+        add_src!(7);
+        reduction(&mut low1, &mut low2, mid1, mid2, &mut high1, &mut high2);
+        let d = vld2q_u8(dst.as_mut_ptr().add(i));
+        vst2q_u8(
+            dst.as_mut_ptr().add(i),
+            uint8x16x2_t(
+                veorq_u8(d.0, vreinterpretq_u8_p16(veorq_p16(low1, low2))),
+                veorq_u8(d.1, vreinterpretq_u8_p16(veorq_p16(high1, high2))),
+            ),
+        );
+        i += BLK;
+    }
+    if i < len {
+        for k in 0..n {
+            if coeffs[k] == 0 {
+                continue;
+            }
+            let slot = BLK * k + interleave * i;
+            muladd_scalar(
+                &mut dst[i..len],
+                &region[slot..slot + (len - i)],
+                coeffs[k],
+                true,
+            );
+        }
+    }
+}
+
 /// Scalar tail - natural u16 word order.
 pub(crate) fn muladd_scalar(dst: &mut [u8], src: &[u8], coeff: u16, add: bool) {
     let words = (src.len() / 2).min(dst.len() / 2);
@@ -205,6 +433,37 @@ impl GfKernel for ClmulNeon {
         unsafe { muladd_run(dst, src, coeff, true) }
     }
 
+    fn muladd_multi(&self, dst: &mut [u8], inputs: &[(&[u8], u16)]) {
+        self.muladd_multi_pf(dst, inputs, std::ptr::null());
+    }
+
+    fn muladd_multi_pf(&self, dst: &mut [u8], inputs: &[(&[u8], u16)], pf_dst: *const u8) {
+        for (k, chunk) in inputs.chunks(8).enumerate() {
+            // packpf: only the first region group prefetches the next tile
+            let pf = if k == 0 { pf_dst } else { std::ptr::null() };
+            unsafe { muladd_multi_run(dst, chunk, pf) }
+        }
+    }
+
+    fn supports_packed(&self) -> bool {
+        true
+    }
+
+    fn muladd_multi_packed(&self, dst: &mut [u8], region: &[u8], interleave: usize, coeffs: &[u16]) {
+        self.muladd_multi_packed_pf(dst, region, interleave, coeffs, std::ptr::null());
+    }
+
+    fn muladd_multi_packed_pf(
+        &self,
+        dst: &mut [u8],
+        region: &[u8],
+        interleave: usize,
+        coeffs: &[u16],
+        pf_dst: *const u8,
+    ) {
+        unsafe { muladd_multi_packed_run(dst, region, interleave, coeffs, pf_dst) }
+    }
+
     fn mul(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
         unsafe { muladd_run(dst, src, coeff, false) }
     }
@@ -245,6 +504,36 @@ impl GfKernel for ClmulSha3 {
 
     fn muladd(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
         unsafe { muladd_run(dst, src, coeff, true) }
+    }
+
+    fn muladd_multi(&self, dst: &mut [u8], inputs: &[(&[u8], u16)]) {
+        self.muladd_multi_pf(dst, inputs, std::ptr::null());
+    }
+
+    fn muladd_multi_pf(&self, dst: &mut [u8], inputs: &[(&[u8], u16)], pf_dst: *const u8) {
+        for (k, chunk) in inputs.chunks(8).enumerate() {
+            let pf = if k == 0 { pf_dst } else { std::ptr::null() };
+            unsafe { muladd_multi_run(dst, chunk, pf) }
+        }
+    }
+
+    fn supports_packed(&self) -> bool {
+        true
+    }
+
+    fn muladd_multi_packed(&self, dst: &mut [u8], region: &[u8], interleave: usize, coeffs: &[u16]) {
+        self.muladd_multi_packed_pf(dst, region, interleave, coeffs, std::ptr::null());
+    }
+
+    fn muladd_multi_packed_pf(
+        &self,
+        dst: &mut [u8],
+        region: &[u8],
+        interleave: usize,
+        coeffs: &[u16],
+        pf_dst: *const u8,
+    ) {
+        unsafe { muladd_multi_packed_run(dst, region, interleave, coeffs, pf_dst) }
     }
 
     fn mul(&self, dst: &mut [u8], src: &[u8], coeff: u16) {
@@ -338,6 +627,90 @@ mod tests {
             let want = d0w ^ gf16_mul(sw, 0xbeef) ^ gf16_mul(sw, 0x1234);
             let ow = (dst[2 * w + 1] as u16) << 8 | dst[2 * w] as u16;
             assert_eq!(ow, want, "w{}", w);
+        }
+    }
+
+    #[test]
+    fn muladd_multi_vs_sequential() {
+        if !std::arch::is_aarch64_feature_detected!("aes") {
+            return;
+        }
+        let k = ClmulNeon;
+        for nsrcs in [1usize, 2, 3, 5, 8] {
+            for len in [BLK, BLK * 8, 33usize, 100] {
+                let srcs: Vec<Vec<u8>> = (0..nsrcs)
+                    .map(|i| {
+                        let mut s = vec![0u8; len];
+                        fill(&mut s, 0xabc + i as u64 * 7 + len as u64);
+                        s
+                    })
+                    .collect();
+                let coeffs: Vec<u16> = (0..nsrcs)
+                    .map(|i| 0x100 + (i as u16) * 0x2d3)
+                    .collect();
+                let mut d0 = vec![0u8; len];
+                fill(&mut d0, 0x777);
+
+                let mut want = d0.clone();
+                for (i, s) in srcs.iter().enumerate() {
+                    k.muladd(&mut want, s, coeffs[i]);
+                }
+                let mut got = d0;
+                let inputs: Vec<(&[u8], u16)> = srcs
+                    .iter()
+                    .zip(&coeffs)
+                    .map(|(s, &c)| (s.as_slice(), c))
+                    .collect();
+                k.muladd_multi(&mut got, &inputs);
+                assert_eq!(got, want, "nsrcs {} len {}", nsrcs, len);
+            }
+        }
+    }
+
+    #[test]
+    fn muladd_multi_packed_vs_sequential() {
+        if !std::arch::is_aarch64_feature_detected!("aes") {
+            return;
+        }
+        let k = ClmulNeon;
+        for nsrcs in [1usize, 2, 3, 5, 8] {
+            for len in [BLK, BLK * 8, 33usize, 100] {
+                let srcs: Vec<Vec<u8>> = (0..nsrcs)
+                    .map(|i| {
+                        let mut s = vec![0u8; len];
+                        fill(&mut s, 0xdef + i as u64 * 11 + len as u64);
+                        s
+                    })
+                    .collect();
+                let coeffs: Vec<u16> = (0..nsrcs)
+                    .map(|i| 0x100 + (i as u16) * 0x1b7)
+                    .collect();
+                // block-interleaved staging: src k's 32B block j at
+                // region[32*(k + nsrcs*j)] - tail bytes sit at the head
+                // of the (partial) last slot, contiguous per src
+                let padded = len.div_ceil(BLK) * BLK;
+                let mut region = vec![0u8; nsrcs * padded];
+                for (k, s) in srcs.iter().enumerate() {
+                    for j in 0..padded / BLK {
+                        let lo = j * BLK;
+                        let hi = (lo + BLK).min(len);
+                        if hi > lo {
+                            region[32 * (k + nsrcs * j)..32 * (k + nsrcs * j) + (hi - lo)]
+                                .copy_from_slice(&s[lo..hi]);
+                        }
+                    }
+                }
+                let mut d0 = vec![0u8; len];
+                fill(&mut d0, 0x555);
+
+                let mut want = d0.clone();
+                for (i, s) in srcs.iter().enumerate() {
+                    k.muladd(&mut want, s, coeffs[i]);
+                }
+                let mut got = d0;
+                k.muladd_multi_packed(&mut got, &region, nsrcs, &coeffs);
+                assert_eq!(got, want, "nsrcs {} len {}", nsrcs, len);
+            }
         }
     }
 }
