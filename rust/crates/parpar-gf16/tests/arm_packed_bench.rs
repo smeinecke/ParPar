@@ -10,6 +10,7 @@ use std::time::Instant;
 const BLK: usize = 32;
 
 #[test]
+#[ignore = "ad-hoc throughput probe - run with --ignored; too slow under qemu CI"]
 fn packed_vs_contiguous() {
     let k = kernel::pick(0);
     eprintln!("kernel {} {}", k.id(), k.name());
@@ -69,6 +70,7 @@ fn packed_vs_contiguous() {
 /// over `nrounds` dst tiles, `nthreads` worker threads - measures the
 /// sustained multiply rate the pipeline actually sees.
 #[test]
+#[ignore = "ad-hoc throughput probe - run with --ignored; too slow under qemu CI"]
 fn aggregate_packed_throughput() {
     let k = kernel::pick(0);
     eprintln!("kernel {} {}", k.id(), k.name());

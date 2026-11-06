@@ -6,6 +6,7 @@ use parpar_gf16::kernel;
 use std::time::Instant;
 
 #[test]
+#[ignore = "ad-hoc throughput probe - run with --ignored; too slow under qemu CI"]
 fn aggregate_muladd_throughput() {
     let k = kernel::pick(0);
     eprintln!("kernel {} {}", k.id(), k.name());
@@ -540,6 +541,7 @@ mod ffi_kernel {
     /// Same-buffers A/B: alternate full sweeps of the C++ FFI kernel and our
     /// Rust muladd in one process so environmental noise hits both equally.
     #[test]
+    #[ignore = "ad-hoc throughput probe - run with --ignored; too slow under qemu CI"]
     fn interleaved_ab() {
         let nins = 24usize;
         let nouts = 205usize;
@@ -694,6 +696,7 @@ mod ffi_kernel {
     }
 
     #[test]
+    #[ignore = "ad-hoc throughput probe - run with --ignored; too slow under qemu CI"]
     fn cpp_kernel_throughput() {
         bench_cpp_shuffle2x();
         bench_cpp_muladd_fallback();
