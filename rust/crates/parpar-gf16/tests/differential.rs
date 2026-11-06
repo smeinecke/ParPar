@@ -1,4 +1,4 @@
-#![cfg(target_env = "gnu")] // FFI oracle only links on gnu targets
+#![cfg(all(target_env = "gnu", target_arch = "x86_64"))] // FFI oracle only links on x86_64-gnu
 
 use parpar_backend::{AddResult, ComputeBackend, CpuSpec, GfProc, ProcEvent, SliceBuf};
 use parpar_ffi::FfiBackend;

@@ -2,6 +2,7 @@
 //! (`test/dump_fileinfo.js` -> `rust/fixtures/fi_*.json`).
 //! Fixture paths are absolute into `rust/fixtures/tree/`; the recorded
 //! prefix is patched to the runtime manifest dir.
+#![cfg(unix)] // the fixture tree includes a fifo - mkfifo/FileTypeExt are unix-only
 
 use parpar::args::Recurse;
 use parpar::fileinfo::file_info;

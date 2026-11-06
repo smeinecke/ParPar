@@ -6,7 +6,7 @@
 // absent_runtime: re-executes this test binary with PARPAR_OCL_LIBRARY
 // pointed at a nonexistent path and checks enumerate() returns empty.
 
-#![cfg(target_env = "gnu")]
+#![cfg(all(target_env = "gnu", target_arch = "x86_64"))]
 use parpar_backend::ComputeBackend;
 use parpar_ffi::FfiBackend;
 

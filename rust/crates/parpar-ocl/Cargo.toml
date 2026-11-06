@@ -9,6 +9,6 @@ description = "Minimal OpenCL FFI bindings for ParPar (dlopen-based, optional)"
 parpar-backend = { path = "../parpar-backend" }
 parpar-gf16 = { path = "../parpar-gf16" }
 
-# FFI oracle links only on gnu targets
-[target.'cfg(target_env = "gnu")'.dev-dependencies]
+# FFI oracle links only on x86_64-gnu targets
+[target.'cfg(all(target_env = "gnu", target_arch = "x86_64"))'.dev-dependencies]
 parpar-ffi = { path = "../parpar-ffi" }

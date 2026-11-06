@@ -1257,11 +1257,19 @@ mod tests {
         };
         let mut p = NativeGfProc::new(0, q.clone(), 64, Some(&cpu), 2).unwrap();
         p.set_recovery_slices(None, 2).unwrap();
-        let mut drain = |p: &NativeGfProc| {
-            while let Some(e) = p.wait_own_event(Duration::from_millis(50)) {
-                if matches!(e, ProcEvent::Ended { .. }) {
-                    break;
-                }
+        // emulated targets (SDE) run the worker far slower than the 50ms
+        // poll granularity - wait against a total deadline, not per-poll
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut next_out = |p: &NativeGfProc| loop {
+            match p.wait_own_event(Duration::from_millis(50)) {
+                Some(e @ ProcEvent::OutputDone { .. }) => return e,
+                _ => assert!(Instant::now() < deadline, "timed out"),
+            }
+        };
+        let mut drain = |p: &NativeGfProc| loop {
+            match p.wait_own_event(Duration::from_millis(50)) {
+                Some(ProcEvent::Ended { .. }) => return,
+                _ => assert!(Instant::now() < deadline, "timed out"),
             }
         };
         // round 1: real input, output must be nonzero
@@ -1271,30 +1279,26 @@ mod tests {
         drain(&p);
         let out = SliceBuf::new(vec![0u8; 64].into_boxed_slice(), 64);
         p.get_output(0, out, 3).unwrap();
-        let mut nonzero = false;
-        while let Some(e) = p.wait_own_event(Duration::from_millis(50)) {
-            if let ProcEvent::OutputDone { buf, cksum_valid, .. } = e {
+        match next_out(&p) {
+            ProcEvent::OutputDone { buf, cksum_valid, .. } => {
                 assert!(buf.data.iter().any(|&b| b != 0));
                 assert!(cksum_valid);
-                nonzero = true;
-                break;
             }
+            _ => unreachable!(),
         }
-        assert!(nonzero, "first round produced no output event");
         // round 2: end with no adds -> outputs must read as zeros, still
         // checksum-valid (empty pass is not corruption)
         p.end_input(4).unwrap();
         drain(&p);
         let out = SliceBuf::new(vec![0u8; 64].into_boxed_slice(), 64);
         p.get_output(0, out, 5).unwrap();
-        while let Some(e) = p.wait_own_event(Duration::from_millis(50)) {
-            if let ProcEvent::OutputDone { buf, cksum_valid, .. } = e {
+        match next_out(&p) {
+            ProcEvent::OutputDone { buf, cksum_valid, .. } => {
                 assert!(buf.data.iter().all(|&b| b == 0));
                 assert!(cksum_valid);
-                return;
             }
+            _ => unreachable!(),
         }
-        panic!("no output event for empty round");
     }
 
     /// get_output after free_mem must not panic - C++ returns a zeroed
